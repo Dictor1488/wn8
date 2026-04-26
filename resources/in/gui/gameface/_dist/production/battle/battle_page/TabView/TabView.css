@@ -2551,14 +2551,33 @@
 }
 
 
-/* WN8WithoutXVM: stat blocks in tab menu */
-.UserInfo_user_info_ee23d > div[style] {
-    font-size: 0.7rem;
+/* WN8WithoutXVM TAB stats */
+.WN8TabStats {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 2rem;
+    margin: -1rem 4rem 0 0;
+    font-size: 13rem;
     line-height: 1;
     white-space: nowrap;
     pointer-events: none;
 }
-.UserInfo_user_info_ee23d > div[style] span {
-    font-size: 0.7rem;
-    font-weight: bold;
+.WN8TabStats_right {
+    flex-direction: row-reverse;
+    margin: -1rem 0 0 4rem;
+}
+.WN8TabStats_item {
+    min-width: 23rem;
+    text-align: center;
+    text-shadow: 0 0 2rem #000, 0 0 3rem #000;
+}
+.WN8TabStats_battles {
+    min-width: 20rem;
+}
+.WN8TabStats_wr {
+    min-width: 34rem;
+}
+.WN8TabStats_wn8 {
+    min-width: 34rem;
 }
