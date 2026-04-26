@@ -2618,3 +2618,20 @@
 .WN8TabStats_wn8 {
     min-width: 26rem;
 }
+
+
+/* WN8WithoutXVM TAB stats v4: stats before nickname */
+.WN8TabStats {
+    order: -10;
+    margin: -1rem 4rem 0 0;
+}
+
+.UserInfo_user_info__right_d5b63 .WN8TabStats,
+.WN8TabStats_right {
+    order: -10;
+    margin: -1rem 0 0 4rem;
+}
+
+.UserInfo_userNameWrapper_ddc08 {
+    min-width: 0;
+}
