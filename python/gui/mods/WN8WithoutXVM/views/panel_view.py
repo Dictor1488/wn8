@@ -349,22 +349,11 @@ class PanelView(CallbackDelayer):
 
     def _pushTabOverlays(self, arenaDP):
         """
-        For each ally/enemy row push a (vehicleID, WN8-html) pair to our SWF
-        overlay. SWF reads playerNameCollection[col*numRows+row] and draws
-        our TextField right next to WG name. Works in Random / Stronghold
-        / Comp7 (all use battlePage.swf + strongholdBattlePage.swf which
-        share FullStatsTable layout).
+        Tab-overlay данные идут через PatchBattlePlayer -> BattlePlayer model fields
+        (wn8, winrate, battles + цвета) -> TabView.js читает через data-bind-value.
+        Flash-канал (as_setTabOverlay) не работает для Gameface таб-меню в WoT 2.x.
         """
-        if not g_events or not g_events.componentUI:
-            return
-        try:
-            ally_ids = vos_collections.AllyItemsCollection().ids(arenaDP)
-            enemy_ids = vos_collections.EnemyItemsCollection().ids(arenaDP)
-            allies = [self._buildTabRow(vID) for vID in ally_ids]
-            enemies = [self._buildTabRow(vID) for vID in enemy_ids]
-            g_events.setTabOverlay(allies, enemies)
-        except Exception as e:
-            logger.debug('[PanelView] _pushTabOverlays error: %s', e)
+        pass
 
     def _buildTabRow(self, vehicleID):
         if not vehicleID:
