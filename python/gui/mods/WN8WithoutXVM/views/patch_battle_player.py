@@ -21,14 +21,17 @@ EXTRA_FIELDS = (
     'battles_color',
 )
 
+SEP = u'\t'
+
 
 class PatchBattlePlayer(object):
     """
-    TAB stats patch through BattlePlayer extra fields.
+    TAB stats patch.
 
-    Do not modify userName or vehicleName. Those fields are rendered by the
-    stock TAB layout and changing them breaks visible nick/clan or vehicle
-    names. TabView.js reads the extra fields below.
+    Keep userName untouched. Extra BattlePlayer fields are still filled, but on
+    current client they may stay empty in Gameface, so stats are also packed
+    into vehicleName. Patched TabView.js must render vehicleName.split(TAB)[0]
+    as the visible tank name and use the hidden parts for WN8/WR/battles.
     """
 
     def __init__(self, stats_manager):
@@ -38,7 +41,7 @@ class PatchBattlePlayer(object):
         self._original_invalidate_personal_info = None
         self._patches_applied = False
         self._stats_manager = stats_manager
-        # vehicleId -> (player, vehicleInfo, tabView weakref)
+        # vehicleId -> (player, vehicleInfo, original_vehicle_name, tabView weakref)
         self._active_players = {}
         self._original_property_count = None
         self._base_index = None
@@ -75,6 +78,15 @@ class PatchBattlePlayer(object):
                 pass
         return setter
 
+    def _strip_payload(self, value):
+        try:
+            value = value or u''
+            if SEP in value:
+                return value.split(SEP, 1)[0]
+            return value
+        except Exception:
+            return value or u''
+
     def _refresh_tab_player(self, tv_ref, player):
         try:
             tv = tv_ref() if tv_ref else None
@@ -87,9 +99,9 @@ class PatchBattlePlayer(object):
 
     def _on_stats_updated(self, account_id):
         try:
-            for vehicle_id, (player, vehicle_info, tv_ref) in list(self._active_players.items()):
+            for vehicle_id, (player, vehicle_info, original_vehicle_name, tv_ref) in list(self._active_players.items()):
                 if vehicle_info.get('accountDBID') == account_id:
-                    if self._set_values(player, vehicle_info):
+                    if self._set_values(player, vehicle_info, original_vehicle_name):
                         self._refresh_tab_player(tv_ref, player)
         except Exception as e:
             logger.debug('[PatchBattlePlayer] update failed: %s', e)
@@ -166,8 +178,14 @@ class PatchBattlePlayer(object):
                 player = self._original_fill_player_model(tv_self, vehicleId, vehicleInfo)
                 if player and vehicleInfo:
                     tv_ref = weakref.ref(tv_self)
-                    self._active_players[vehicleId] = (player, vehicleInfo, tv_ref)
-                    self._set_values(player, vehicleInfo)
+                    original_vehicle_name = u''
+                    try:
+                        if hasattr(player, 'getVehicleName'):
+                            original_vehicle_name = self._strip_payload(player.getVehicleName() or u'')
+                    except Exception:
+                        original_vehicle_name = u''
+                    self._active_players[vehicleId] = (player, vehicleInfo, original_vehicle_name, tv_ref)
+                    self._set_values(player, vehicleInfo, original_vehicle_name)
                 return player
 
             TabView._fillPlayerModel = patched_fill_player_model
@@ -182,8 +200,8 @@ class PatchBattlePlayer(object):
                         if hasattr(player, 'getVehicleId'):
                             vehicleId = player.getVehicleId()
                             if vehicleId and vehicleId in self._active_players:
-                                _, info, tv_ref = self._active_players[vehicleId]
-                                if self._set_values(player, info):
+                                _, info, original_vehicle_name, tv_ref = self._active_players[vehicleId]
+                                if self._set_values(player, info, original_vehicle_name):
                                     self._refresh_tab_player(tv_ref, player)
                     except Exception as e:
                         logger.debug('[PatchBattlePlayer] invalidate refresh failed: %s', e)
@@ -198,7 +216,7 @@ class PatchBattlePlayer(object):
             logger.error('[PatchBattlePlayer] Traceback: %s', traceback.format_exc())
             return False
 
-    def _set_values(self, player, vehicleInfo):
+    def _set_values(self, player, vehicleInfo, original_vehicle_name):
         try:
             account_id = vehicleInfo.get('accountDBID') if vehicleInfo else None
             if not account_id:
@@ -212,26 +230,43 @@ class PatchBattlePlayer(object):
             winrate = float(stats.get('winrate', 0) or 0)
             battles = int(stats.get('battles', 0) or 0)
 
+            wn8_text = str(wn8) if g_configParams.showWn8.value and wn8 else ''
+            winrate_text = ('%.1f%%' % winrate) if g_configParams.showWinrate.value and winrate else ''
+            battles_text = get_format_battles(battles) if g_configParams.showBattles.value and battles else ''
+
             wn8_color = get_wn8_color(wn8) if wn8 else '#FFFFFF'
             wr_color = get_winrate_color(winrate) if winrate else '#FFFFFF'
             b_color = get_battles_color(battles) if battles else '#FFFFFF'
 
+            # Fill extra fields too, for clients where they work.
             if hasattr(player, 'setWn8Color'):
                 player.setWn8Color(wn8_color)
             if hasattr(player, 'setWinrateColor'):
                 player.setWinrateColor(wr_color)
             if hasattr(player, 'setBattlesColor'):
                 player.setBattlesColor(b_color)
-
             if hasattr(player, 'setWn8'):
-                player.setWn8(str(wn8) if g_configParams.showWn8.value and wn8 else '')
+                player.setWn8(wn8_text)
             if hasattr(player, 'setWinrate'):
-                player.setWinrate('%.1f%%' % winrate if g_configParams.showWinrate.value and winrate else '')
+                player.setWinrate(winrate_text)
             if hasattr(player, 'setBattles'):
-                player.setBattles(get_format_battles(battles) if g_configParams.showBattles.value and battles else '')
+                player.setBattles(battles_text)
 
-            logger.debug('[PatchBattlePlayer] values set acc=%s wn8=%s wr=%.1f battles=%s',
-                         account_id, wn8, winrate, battles)
+            # Reliable transport for current Gameface: visible name is part [0].
+            if hasattr(player, 'setVehicleName'):
+                payload = SEP.join((
+                    original_vehicle_name or u'',
+                    wn8_text,
+                    wn8_color,
+                    winrate_text,
+                    wr_color,
+                    battles_text,
+                    b_color,
+                ))
+                player.setVehicleName(payload)
+
+            logger.debug('[PatchBattlePlayer] values set acc=%s vehicle=%s wn8=%s wr=%s battles=%s',
+                         account_id, original_vehicle_name, wn8_text, winrate_text, battles_text)
             return True
         except Exception as e:
             logger.debug('[PatchBattlePlayer] setValues failed: %s', e)
