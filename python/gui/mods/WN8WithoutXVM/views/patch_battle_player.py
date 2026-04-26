@@ -1,4 +1,5 @@
 import inspect
+import weakref
 from functools import wraps
 
 from ..utils import (
@@ -25,9 +26,9 @@ class PatchBattlePlayer(object):
     """
     TAB stats patch through BattlePlayer extra fields.
 
-    Important: do not modify userName or vehicleName here. Those fields are
-    rendered by the stock TAB layout and changing them breaks visible nick/clan
-    or vehicle names. TabView.js should read the extra fields below.
+    Do not modify userName or vehicleName. Those fields are rendered by the
+    stock TAB layout and changing them breaks visible nick/clan or vehicle
+    names. TabView.js reads the extra fields below.
     """
 
     def __init__(self, stats_manager):
@@ -37,6 +38,7 @@ class PatchBattlePlayer(object):
         self._original_invalidate_personal_info = None
         self._patches_applied = False
         self._stats_manager = stats_manager
+        # vehicleId -> (player, vehicleInfo, tabView weakref)
         self._active_players = {}
         self._original_property_count = None
         self._base_index = None
@@ -73,11 +75,22 @@ class PatchBattlePlayer(object):
                 pass
         return setter
 
+    def _refresh_tab_player(self, tv_ref, player):
+        try:
+            tv = tv_ref() if tv_ref else None
+            if tv is not None:
+                tv.modifyBattlePlayer(player)
+                return True
+        except Exception as e:
+            logger.debug('[PatchBattlePlayer] modifyBattlePlayer failed: %s', e)
+        return False
+
     def _on_stats_updated(self, account_id):
         try:
-            for vehicle_id, (player, vehicle_info) in list(self._active_players.items()):
+            for vehicle_id, (player, vehicle_info, tv_ref) in list(self._active_players.items()):
                 if vehicle_info.get('accountDBID') == account_id:
-                    self._set_values(player, vehicle_info)
+                    if self._set_values(player, vehicle_info):
+                        self._refresh_tab_player(tv_ref, player)
         except Exception as e:
             logger.debug('[PatchBattlePlayer] update failed: %s', e)
 
@@ -152,7 +165,8 @@ class PatchBattlePlayer(object):
             def patched_fill_player_model(tv_self, vehicleId, vehicleInfo):
                 player = self._original_fill_player_model(tv_self, vehicleId, vehicleInfo)
                 if player and vehicleInfo:
-                    self._active_players[vehicleId] = (player, vehicleInfo)
+                    tv_ref = weakref.ref(tv_self)
+                    self._active_players[vehicleId] = (player, vehicleInfo, tv_ref)
                     self._set_values(player, vehicleInfo)
                 return player
 
@@ -168,8 +182,9 @@ class PatchBattlePlayer(object):
                         if hasattr(player, 'getVehicleId'):
                             vehicleId = player.getVehicleId()
                             if vehicleId and vehicleId in self._active_players:
-                                _, info = self._active_players[vehicleId]
-                                self._set_values(player, info)
+                                _, info, tv_ref = self._active_players[vehicleId]
+                                if self._set_values(player, info):
+                                    self._refresh_tab_player(tv_ref, player)
                     except Exception as e:
                         logger.debug('[PatchBattlePlayer] invalidate refresh failed: %s', e)
 
@@ -187,11 +202,11 @@ class PatchBattlePlayer(object):
         try:
             account_id = vehicleInfo.get('accountDBID') if vehicleInfo else None
             if not account_id:
-                return
+                return False
 
             stats = self._stats_manager.get_cached_stats(account_id)
             if not stats:
-                return
+                return False
 
             wn8 = int(stats.get('wn8', 0) or 0)
             winrate = float(stats.get('winrate', 0) or 0)
@@ -211,15 +226,16 @@ class PatchBattlePlayer(object):
             if hasattr(player, 'setWn8'):
                 player.setWn8(str(wn8) if g_configParams.showWn8.value and wn8 else '')
             if hasattr(player, 'setWinrate'):
-                # Keep percent here. TabView.js should display this field directly.
                 player.setWinrate('%.1f%%' % winrate if g_configParams.showWinrate.value and winrate else '')
             if hasattr(player, 'setBattles'):
                 player.setBattles(get_format_battles(battles) if g_configParams.showBattles.value and battles else '')
 
             logger.debug('[PatchBattlePlayer] values set acc=%s wn8=%s wr=%.1f battles=%s',
                          account_id, wn8, winrate, battles)
+            return True
         except Exception as e:
             logger.debug('[PatchBattlePlayer] setValues failed: %s', e)
+            return False
 
     def apply_patches(self):
         if self._patches_applied:
