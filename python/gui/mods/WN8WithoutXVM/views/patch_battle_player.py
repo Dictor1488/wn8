@@ -1,4 +1,5 @@
 import inspect
+import weakref
 from functools import wraps
 
 from ..utils import (
@@ -20,6 +21,7 @@ EXTRA_FIELDS = (
     'battles_color',
 )
 
+
 class PatchBattlePlayer(object):
 
     def __init__(self, stats_manager):
@@ -29,14 +31,18 @@ class PatchBattlePlayer(object):
         self._original_invalidate_personal_info = None
         self._patches_applied = False
         self._stats_manager = stats_manager
-        self._active_players = {}
+        self._active_players = {}       # vehicleId -> (player, vehicleInfo)
+        self._tab_view_instances = []   # weakref список живих TabView інстансів
         self._original_property_count = None
         self._base_index = None
         stats_manager.add_update_callback(self._on_stats_updated)
 
+    # ------------------------------------------------------------------
+    # Property count discovery
+    # ------------------------------------------------------------------
 
     def _discover_property_count(self, original_init):
-        # Метод 1: через inspect — работает если properties имеет дефолтное значение
+        # Метод 1: через inspect
         try:
             argspec = inspect.getargspec(original_init)
             logger.debug('[PatchBattlePlayer] BattlePlayer.__init__ args=%s defaults=%s',
@@ -50,7 +56,7 @@ class PatchBattlePlayer(object):
         except Exception as e:
             logger.debug('[PatchBattlePlayer] inspect failed: %s', e)
 
-        # Метод 2: создаём временный экземпляр и смотрим внутренний счётчик ViewModel
+        # Метод 2: тимчасовий екземпляр
         if self._original_property_count is None:
             try:
                 from gui.impl.gen.view_models.common.battle_player import BattlePlayer
@@ -65,7 +71,7 @@ class PatchBattlePlayer(object):
             except Exception as e:
                 logger.debug('[PatchBattlePlayer] tmp instance discovery failed: %s', e)
 
-        # Метод 3: подсчёт property-дескрипторов в классе
+        # Метод 3: підрахунок getter/setter пар
         if self._original_property_count is None:
             try:
                 from gui.impl.gen.view_models.common.battle_player import BattlePlayer
@@ -103,15 +109,51 @@ class PatchBattlePlayer(object):
                 pass
         return setter
 
+    # ------------------------------------------------------------------
+    # Stats update callback
+    # ------------------------------------------------------------------
 
     def _on_stats_updated(self, account_id):
         try:
+            updated_players = []
             for vehicle_id, (player, vehicle_info) in list(self._active_players.items()):
                 if vehicle_info.get('accountDBID') == account_id:
                     self._set_values(player, vehicle_info)
+                    updated_players.append(player)
+
+            # Примусово тригеримо рефреш в усіх живих TabView інстансах
+            if updated_players:
+                self._force_refresh_tab_view(updated_players)
+
         except Exception as e:
             logger.debug('[PatchBattlePlayer] update failed: %s', e)
 
+    def _force_refresh_tab_view(self, players):
+        """Викликає _invalidatePersonalInfo для оновлених гравців —
+        це примушує Coherent GT перечитати модель і оновити DOM."""
+        dead = []
+        for ref in self._tab_view_instances:
+            tv = ref()
+            if tv is None:
+                dead.append(ref)
+                continue
+            for player in players:
+                try:
+                    if self._original_invalidate_personal_info:
+                        self._original_invalidate_personal_info(tv, player)
+                    elif hasattr(tv, '_invalidatePersonalInfo'):
+                        tv._invalidatePersonalInfo(player)
+                except Exception as e:
+                    logger.debug('[PatchBattlePlayer] force refresh failed: %s', e)
+        for ref in dead:
+            try:
+                self._tab_view_instances.remove(ref)
+            except ValueError:
+                pass
+
+    # ------------------------------------------------------------------
+    # BattlePlayer patch
+    # ------------------------------------------------------------------
 
     def _monkey_patch_battle_player(self):
         try:
@@ -170,6 +212,10 @@ class PatchBattlePlayer(object):
             logger.error('[PatchBattlePlayer] Traceback: %s', traceback.format_exc())
             return False
 
+    # ------------------------------------------------------------------
+    # TabView patch
+    # ------------------------------------------------------------------
+
     def _monkey_patch_tab_view(self):
         try:
             from gui.impl.battle.battle_page.tab_view import TabView
@@ -182,6 +228,9 @@ class PatchBattlePlayer(object):
 
             @wraps(self._original_fill_player_model)
             def patched_fill_player_model(tv_self, vehicleId, vehicleInfo):
+                # Зберігаємо weakref на цей TabView інстанс
+                self._register_tab_view_instance(tv_self)
+
                 player = self._original_fill_player_model(tv_self, vehicleId, vehicleInfo)
                 if player and vehicleInfo:
                     self._active_players[vehicleId] = (player, vehicleInfo)
@@ -215,6 +264,19 @@ class PatchBattlePlayer(object):
             logger.error('[PatchBattlePlayer] Traceback: %s', traceback.format_exc())
             return False
 
+    def _register_tab_view_instance(self, tv_self):
+        try:
+            for ref in self._tab_view_instances:
+                if ref() is tv_self:
+                    return
+            self._tab_view_instances.append(weakref.ref(tv_self))
+            logger.debug('[PatchBattlePlayer] TabView instance registered')
+        except Exception as e:
+            logger.debug('[PatchBattlePlayer] register instance failed: %s', e)
+
+    # ------------------------------------------------------------------
+    # Set stat values on player model
+    # ------------------------------------------------------------------
 
     def _set_values(self, player, vehicleInfo):
         try:
@@ -258,9 +320,13 @@ class PatchBattlePlayer(object):
                     player.setBattles(get_format_battles(battles))
                 else:
                     player.setBattles('')
+
         except Exception as e:
             logger.debug('[PatchBattlePlayer] setValues failed: %s', e)
 
+    # ------------------------------------------------------------------
+    # Apply / remove
+    # ------------------------------------------------------------------
 
     def apply_patches(self):
         if self._patches_applied:
@@ -283,6 +349,7 @@ class PatchBattlePlayer(object):
 
             if not self._patches_applied:
                 self._active_players.clear()
+                self._tab_view_instances = []
                 return True
 
             from gui.impl.gen.view_models.common.battle_player import BattlePlayer
@@ -309,6 +376,7 @@ class PatchBattlePlayer(object):
                 TabView._invalidatePersonalInfo = self._original_invalidate_personal_info
 
             self._active_players.clear()
+            self._tab_view_instances = []
             self._patches_applied = False
             return True
         except Exception as e:
