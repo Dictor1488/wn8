@@ -3,9 +3,6 @@ from functools import wraps
 
 from ..utils import (
     logger,
-    get_wn8_color,
-    get_winrate_color,
-    get_battles_color,
     get_format_battles
 )
 from ..settings.config_param import g_configParams
@@ -13,13 +10,16 @@ from ..settings.config_param import g_configParams
 import logging
 logger.setLevel(logging.DEBUG)
 
-# TAB/Gameface renders existing BattlePlayer fields reliably.
-# Adding custom WULF properties is fragile between WoT versions, so we pass
-# WN8 data through userName and decode it in TabView.js / DOM patch.
-ENCODE_SEPARATOR = u'\t'
-
 
 class PatchBattlePlayer(object):
+    """
+    Reliable TAB stats patch.
+
+    Do not extend BattlePlayer schema with custom WULF fields. That approach is
+    version-fragile and can silently write to wrong property slots. Instead we
+    use the already rendered userName field, so TAB shows stats even when the
+    custom Gameface bundle is not decoding extra fields yet.
+    """
 
     def __init__(self, stats_manager):
         self._original_fill_player_model = None
@@ -35,7 +35,7 @@ class PatchBattlePlayer(object):
         try:
             for vid, (player, info, original_user_name, tv_ref) in list(self._active_players.items()):
                 if info.get('accountDBID') == account_id:
-                    self._set_encoded_name(player, info, original_user_name)
+                    self._set_tab_name(player, info, original_user_name)
                     tv = tv_ref() if tv_ref else None
                     if tv is not None:
                         try:
@@ -45,15 +45,41 @@ class PatchBattlePlayer(object):
         except Exception as e:
             logger.debug('[PatchBattlePlayer] update failed: %s', e)
 
-    def _decode_original_name(self, user_name):
+    def _strip_old_stats_prefix(self, user_name):
         try:
-            if user_name and ENCODE_SEPARATOR in user_name:
-                return user_name.split(ENCODE_SEPARATOR, 1)[0]
+            name = user_name or u''
+            if name.startswith(u'[') and u'] ' in name:
+                return name.split(u'] ', 1)[1]
+            return name
+        except Exception:
+            return user_name or u''
+
+    def _build_stats_prefix(self, stats):
+        parts = []
+        try:
+            if g_configParams.showWn8.value:
+                wn8 = int(stats.get('wn8', 0) or 0)
+                if wn8:
+                    parts.append(str(wn8))
         except Exception:
             pass
-        return user_name or u''
+        try:
+            if g_configParams.showWinrate.value:
+                winrate = float(stats.get('winrate', 0) or 0)
+                if winrate:
+                    parts.append('%.1f%%' % winrate)
+        except Exception:
+            pass
+        try:
+            if g_configParams.showBattles.value:
+                battles = int(stats.get('battles', 0) or 0)
+                if battles:
+                    parts.append(get_format_battles(battles))
+        except Exception:
+            pass
+        return u'|'.join([unicode(p) if not isinstance(p, unicode) else p for p in parts])
 
-    def _set_encoded_name(self, player, vehicleInfo, original_user_name):
+    def _set_tab_name(self, player, vehicleInfo, original_user_name):
         try:
             account_id = vehicleInfo.get('accountDBID') if vehicleInfo else None
             if not account_id:
@@ -63,38 +89,21 @@ class PatchBattlePlayer(object):
             if not stats:
                 return
 
-            wn8 = int(stats.get('wn8', 0) or 0)
-            winrate = float(stats.get('winrate', 0) or 0)
-            battles = int(stats.get('battles', 0) or 0)
+            prefix = self._build_stats_prefix(stats)
+            clean_name = self._strip_old_stats_prefix(original_user_name)
+            if not clean_name:
+                clean_name = u''
 
-            wn8_text = str(wn8) if g_configParams.showWn8.value and wn8 else ''
-            wn8_color = get_wn8_color(wn8) if wn8 else '#FFFFFF'
-            winrate_text = ('%.1f' % winrate) if g_configParams.showWinrate.value and winrate else ''
-            winrate_color = get_winrate_color(winrate) if winrate else '#FFFFFF'
-            battles_text = get_format_battles(battles) if g_configParams.showBattles.value and battles else ''
-            battles_color = get_battles_color(battles) if battles else '#FFFFFF'
-
-            encoded = ENCODE_SEPARATOR.join((
-                original_user_name or u'',
-                wn8_text,
-                wn8_color,
-                winrate_text,
-                winrate_color,
-                battles_text,
-                battles_color,
-            ))
+            display_name = u'[%s] %s' % (prefix, clean_name) if prefix else clean_name
 
             if hasattr(player, 'setUserName'):
-                player.setUserName(encoded)
-                logger.debug('[PatchBattlePlayer] encoded TAB stats set wn8=%s wr=%s battles=%s for %s',
-                             wn8_text, winrate_text, battles_text, account_id)
+                player.setUserName(display_name)
+                logger.debug('[PatchBattlePlayer] TAB name set for %s: %s', account_id, display_name)
         except Exception as e:
-            logger.debug('[PatchBattlePlayer] _set_encoded_name failed: %s', e)
+            logger.debug('[PatchBattlePlayer] _set_tab_name failed: %s', e)
 
     def _monkey_patch_battle_player(self):
-        # No BattlePlayer schema extension here. Existing userName is safer and
-        # survives client-side model changes better than _addStringProperty slots.
-        logger.debug('[PatchBattlePlayer] Using encoded userName transport')
+        logger.debug('[PatchBattlePlayer] Using visible userName TAB transport')
         return True
 
     def _monkey_patch_tab_view(self):
@@ -116,11 +125,11 @@ class PatchBattlePlayer(object):
                     original_user_name = u''
                     try:
                         if hasattr(player, 'getUserName'):
-                            original_user_name = self._decode_original_name(player.getUserName() or u'')
+                            original_user_name = self._strip_old_stats_prefix(player.getUserName() or u'')
                     except Exception:
                         original_user_name = u''
                     self._active_players[vehicleId] = (player, vehicleInfo or {}, original_user_name, tv_ref)
-                    self._set_encoded_name(player, vehicleInfo or {}, original_user_name)
+                    self._set_tab_name(player, vehicleInfo or {}, original_user_name)
                 return player
 
             TabView._fillPlayerModel = patched_fill_player_model
@@ -136,13 +145,13 @@ class PatchBattlePlayer(object):
                             vid = player.getVehicleId()
                             if vid and vid in self._active_players:
                                 p, info, original_user_name, _ = self._active_players[vid]
-                                self._set_encoded_name(p, info, original_user_name)
+                                self._set_tab_name(p, info, original_user_name)
                     except Exception as e:
                         logger.debug('[PatchBattlePlayer] invalidate: %s', e)
 
                 TabView._invalidatePersonalInfo = patched_invalidate
 
-            logger.debug('[PatchBattlePlayer] TabView patched with encoded userName')
+            logger.debug('[PatchBattlePlayer] TabView patched with visible userName stats')
             return True
         except Exception as e:
             logger.error('[PatchBattlePlayer] TabView patch failed: %s', e)
