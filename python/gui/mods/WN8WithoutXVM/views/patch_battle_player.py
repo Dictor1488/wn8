@@ -35,34 +35,24 @@ class PatchBattlePlayer(object):
         self._original_invalidate_personal_info = None
         self._patches_applied = False
         self._stats_manager = stats_manager
-        # vehicleId -> (player, vehicleInfo, weakref до TabView)
         self._active_players = {}
         self._tab_view_instances = []
         self._original_property_count = None
         self._base_index = None
         stats_manager.add_update_callback(self._on_stats_updated)
 
-    # ------------------------------------------------------------------
-    # Property count discovery
-    # ------------------------------------------------------------------
-
     def _discover_property_count(self, original_init):
         try:
             argspec = inspect.getargspec(original_init)
-            logger.debug('[PatchBattlePlayer] BattlePlayer.__init__ args=%s defaults=%s',
-                         argspec.args, argspec.defaults)
             if argspec.defaults and 'properties' in argspec.args:
                 idx = argspec.args.index('properties') - 1
                 if 0 <= idx < len(argspec.defaults):
                     self._original_property_count = argspec.defaults[idx]
-                    logger.debug('[PatchBattlePlayer] property count from defaults: %s',
-                                 self._original_property_count)
         except Exception as e:
             logger.debug('[PatchBattlePlayer] inspect failed: %s', e)
 
         if self._original_property_count is None:
             self._original_property_count = 37
-            logger.warning('[PatchBattlePlayer] Using fallback property count: 37')
 
         self._base_index = self._original_property_count
         logger.debug('[PatchBattlePlayer] Final base_index=%s', self._base_index)
@@ -83,44 +73,26 @@ class PatchBattlePlayer(object):
                 pass
         return setter
 
-    # ------------------------------------------------------------------
-    # Stats update — викликається коли WG API повернув стату
-    # ------------------------------------------------------------------
-
     def _on_stats_updated(self, account_id):
         try:
-            updated = []
-            for vehicle_id, (player, vehicle_info, tv_ref) in list(self._active_players.items()):
+            for vehicle_id, entry in list(self._active_players.items()):
+                player, vehicle_info, tv_ref = entry
                 if vehicle_info.get('accountDBID') == account_id:
                     self._set_values(player, vehicle_info)
                     tv = tv_ref() if tv_ref else None
-                    updated.append((player, tv))
-
-            # Примусовий рефреш через modifyBattlePlayer або _invalidatePersonalInfo
-            for player, tv in updated:
-                if tv is not None:
-                    self._refresh_player(tv, player)
+                    if tv is not None:
+                        self._refresh_player(tv, player)
         except Exception as e:
             logger.debug('[PatchBattlePlayer] _on_stats_updated failed: %s', e)
 
     def _refresh_player(self, tv, player):
-        """Тригерить оновлення DOM для конкретного гравця."""
         try:
-            # Спосіб 1: modifyBattlePlayer — публічний API для модів
             if hasattr(tv, 'modifyBattlePlayer'):
                 tv.modifyBattlePlayer(player)
-                return
-            # Спосіб 2: _invalidatePersonalInfo
-            if self._original_invalidate_personal_info:
+            elif self._original_invalidate_personal_info:
                 self._original_invalidate_personal_info(tv, player)
-            elif hasattr(tv, '_invalidatePersonalInfo'):
-                tv._invalidatePersonalInfo(player)
         except Exception as e:
             logger.debug('[PatchBattlePlayer] _refresh_player failed: %s', e)
-
-    # ------------------------------------------------------------------
-    # BattlePlayer patch
-    # ------------------------------------------------------------------
 
     def _monkey_patch_battle_player(self):
         try:
@@ -138,10 +110,7 @@ class PatchBattlePlayer(object):
             base_count = self._original_property_count
 
             def patched_constructor(bp_self, properties=None, commands=0):
-                if properties is not None and properties != base_count:
-                    total = properties + extra
-                else:
-                    total = base_count + extra
+                total = (properties + extra) if (properties is not None and properties != base_count) else (base_count + extra)
                 try:
                     self._original_battle_player_constructor(bp_self, properties=total, commands=commands)
                 except Exception:
@@ -156,6 +125,11 @@ class PatchBattlePlayer(object):
                     for field in EXTRA_FIELDS:
                         default = '#FFFFFF' if field.endswith('_color') else ''
                         bp_self._addStringProperty(field, default)
+                    # ДІАГНОСТИКА: перевіряємо чи getter/setter працюють
+                    if hasattr(bp_self, 'setWn8') and hasattr(bp_self, 'getWn8'):
+                        bp_self.setWn8('TEST')
+                        readback = bp_self.getWn8()
+                        logger.debug('[PatchBattlePlayer] Readback test: setWn8(TEST) -> getWn8()=%r', readback)
                 except Exception as e:
                     logger.debug('[PatchBattlePlayer] addStringProperty failed: %s', e)
 
@@ -179,10 +153,6 @@ class PatchBattlePlayer(object):
             logger.error('[PatchBattlePlayer] Traceback: %s', traceback.format_exc())
             return False
 
-    # ------------------------------------------------------------------
-    # TabView patch — патчимо обидва методи заповнення
-    # ------------------------------------------------------------------
-
     def _monkey_patch_tab_view(self):
         try:
             from gui.impl.battle.battle_page.tab_view import TabView
@@ -191,7 +161,6 @@ class PatchBattlePlayer(object):
             return False
 
         try:
-            # Патчимо _fillPlayerModel
             self._original_fill_player_model = TabView._fillPlayerModel
 
             @wraps(self._original_fill_player_model)
@@ -202,12 +171,10 @@ class PatchBattlePlayer(object):
                     tv_ref = weakref.ref(tv_self)
                     self._active_players[vehicleId] = (player, vehicleInfo or {}, tv_ref)
                     self._set_values(player, vehicleInfo or {})
-                    logger.debug('[PatchBattlePlayer] _fillPlayerModel vehicleId=%s', vehicleId)
                 return player
 
             TabView._fillPlayerModel = patched_fill_player_model
 
-            # Патчимо _fillPlayerListModel якщо є
             if hasattr(TabView, '_fillPlayerListModel'):
                 self._original_fill_player_list_model = TabView._fillPlayerListModel
 
@@ -220,7 +187,6 @@ class PatchBattlePlayer(object):
 
                 TabView._fillPlayerListModel = patched_fill_player_list_model
 
-            # Патчимо _invalidatePersonalInfo
             if hasattr(TabView, '_invalidatePersonalInfo'):
                 self._original_invalidate_personal_info = TabView._invalidatePersonalInfo
 
@@ -252,13 +218,8 @@ class PatchBattlePlayer(object):
                 if ref() is tv_self:
                     return
             self._tab_view_instances.append(weakref.ref(tv_self))
-            logger.debug('[PatchBattlePlayer] TabView instance registered')
         except Exception as e:
             logger.debug('[PatchBattlePlayer] register instance failed: %s', e)
-
-    # ------------------------------------------------------------------
-    # Set stat values on BattlePlayer model
-    # ------------------------------------------------------------------
 
     def _set_values(self, player, vehicleInfo):
         try:
@@ -288,7 +249,11 @@ class PatchBattlePlayer(object):
             if hasattr(player, 'setWn8'):
                 if g_configParams.showWn8.value and wn8:
                     player.setWn8(str(wn8))
-                    logger.debug('[PatchBattlePlayer] Set wn8=%s for account %s', wn8, account_id)
+                    # ДІАГНОСТИКА: перевіряємо readback
+                    if hasattr(player, 'getWn8'):
+                        readback = player.getWn8()
+                        logger.debug('[PatchBattlePlayer] Set wn8=%s -> readback=%r for account %s',
+                                     wn8, readback, account_id)
                 else:
                     player.setWn8('')
 
@@ -306,10 +271,6 @@ class PatchBattlePlayer(object):
 
         except Exception as e:
             logger.debug('[PatchBattlePlayer] setValues failed: %s', e)
-
-    # ------------------------------------------------------------------
-    # Apply / remove
-    # ------------------------------------------------------------------
 
     def apply_patches(self):
         if self._patches_applied:
