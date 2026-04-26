@@ -1,10 +1,7 @@
 import weakref
 from functools import wraps
 
-from ..utils import (
-    logger,
-    get_format_battles
-)
+from ..utils import logger
 from ..settings.config_param import g_configParams
 
 import logging
@@ -15,9 +12,9 @@ class PatchBattlePlayer(object):
     """
     Reliable TAB stats patch.
 
-    Do not touch userName anymore: in current Gameface TAB it breaks visible
-    nick/clan layout. Stats are written only into vehicleName, which is known
-    to be rendered in TAB.
+    Do not touch userName: in current Gameface TAB it breaks visible nick/clan
+    layout. Stats are written only into vehicleName, which is known to be
+    rendered in TAB. Keep the prefix compact so vehicle names stay readable.
     """
 
     def __init__(self, stats_manager):
@@ -65,29 +62,31 @@ class PatchBattlePlayer(object):
                 return u''
 
     def _build_stats_prefix(self, stats):
-        parts = []
+        """Compact TAB prefix: WN8/WR only. Battles are too long for TAB."""
+        wn8_text = u''
+        wr_text = u''
         try:
             if g_configParams.showWn8.value:
                 wn8 = int(stats.get('wn8', 0) or 0)
                 if wn8:
-                    parts.append(str(wn8))
+                    wn8_text = self._to_unicode(wn8)
         except Exception:
             pass
         try:
             if g_configParams.showWinrate.value:
                 winrate = float(stats.get('winrate', 0) or 0)
                 if winrate:
-                    parts.append('%.1f%%' % winrate)
+                    wr_text = self._to_unicode(int(round(winrate)))
         except Exception:
             pass
-        try:
-            if g_configParams.showBattles.value:
-                battles = int(stats.get('battles', 0) or 0)
-                if battles:
-                    parts.append(get_format_battles(battles))
-        except Exception:
-            pass
-        return u'|'.join([self._to_unicode(p) for p in parts])
+
+        if wn8_text and wr_text:
+            return u'%s/%s' % (wn8_text, wr_text)
+        if wn8_text:
+            return wn8_text
+        if wr_text:
+            return wr_text
+        return u''
 
     def _set_tab_vehicle_name(self, player, vehicleInfo, original_vehicle_name):
         try:
@@ -112,7 +111,7 @@ class PatchBattlePlayer(object):
             logger.debug('[PatchBattlePlayer] _set_tab_vehicle_name failed: %s', e)
 
     def _monkey_patch_battle_player(self):
-        logger.debug('[PatchBattlePlayer] Using vehicleName-only TAB stats transport')
+        logger.debug('[PatchBattlePlayer] Using compact vehicleName TAB stats transport')
         return True
 
     def _monkey_patch_tab_view(self):
@@ -160,7 +159,7 @@ class PatchBattlePlayer(object):
 
                 TabView._invalidatePersonalInfo = patched_invalidate
 
-            logger.debug('[PatchBattlePlayer] TabView patched with vehicleName-only stats')
+            logger.debug('[PatchBattlePlayer] TabView patched with compact vehicleName stats')
             return True
         except Exception as e:
             logger.error('[PatchBattlePlayer] TabView patch failed: %s', e)
