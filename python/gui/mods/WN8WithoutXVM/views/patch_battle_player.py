@@ -11,7 +11,6 @@ from ..utils import (
 )
 from ..settings.config_param import g_configParams
 
-# Примусово вмикаємо DEBUG лог незалежно від .debug_mods
 import logging
 logger.setLevel(logging.DEBUG)
 
@@ -32,14 +31,20 @@ class PatchBattlePlayer(object):
         self._original_battle_player_constructor = None
         self._original_battle_player_initialize = None
         self._original_fill_player_model = None
+        self._original_fill_player_list_model = None
         self._original_invalidate_personal_info = None
         self._patches_applied = False
         self._stats_manager = stats_manager
+        # vehicleId -> (player, vehicleInfo, weakref до TabView)
         self._active_players = {}
         self._tab_view_instances = []
         self._original_property_count = None
         self._base_index = None
         stats_manager.add_update_callback(self._on_stats_updated)
+
+    # ------------------------------------------------------------------
+    # Property count discovery
+    # ------------------------------------------------------------------
 
     def _discover_property_count(self, original_init):
         try:
@@ -54,34 +59,6 @@ class PatchBattlePlayer(object):
                                  self._original_property_count)
         except Exception as e:
             logger.debug('[PatchBattlePlayer] inspect failed: %s', e)
-
-        if self._original_property_count is None:
-            try:
-                from gui.impl.gen.view_models.common.battle_player import BattlePlayer
-                tmp = object.__new__(BattlePlayer)
-                original_init(tmp)
-                for attr in ('_propertiesCount', '_propertyCount', '_properties_count'):
-                    if hasattr(tmp, attr):
-                        self._original_property_count = getattr(tmp, attr)
-                        logger.debug('[PatchBattlePlayer] property count from %s: %s',
-                                     attr, self._original_property_count)
-                        break
-            except Exception as e:
-                logger.debug('[PatchBattlePlayer] tmp instance discovery failed: %s', e)
-
-        if self._original_property_count is None:
-            try:
-                from gui.impl.gen.view_models.common.battle_player import BattlePlayer
-                count = sum(
-                    1 for name in dir(BattlePlayer)
-                    if name.startswith('get') and callable(getattr(BattlePlayer, name, None))
-                    and hasattr(BattlePlayer, 'set' + name[3:])
-                )
-                if count > 0:
-                    self._original_property_count = count
-                    logger.debug('[PatchBattlePlayer] property count from getter scan: %s', count)
-            except Exception as e:
-                logger.debug('[PatchBattlePlayer] getter scan failed: %s', e)
 
         if self._original_property_count is None:
             self._original_property_count = 37
@@ -106,38 +83,44 @@ class PatchBattlePlayer(object):
                 pass
         return setter
 
+    # ------------------------------------------------------------------
+    # Stats update — викликається коли WG API повернув стату
+    # ------------------------------------------------------------------
+
     def _on_stats_updated(self, account_id):
         try:
-            updated_players = []
-            for vehicle_id, (player, vehicle_info) in list(self._active_players.items()):
+            updated = []
+            for vehicle_id, (player, vehicle_info, tv_ref) in list(self._active_players.items()):
                 if vehicle_info.get('accountDBID') == account_id:
                     self._set_values(player, vehicle_info)
-                    updated_players.append(player)
-            if updated_players:
-                self._force_refresh_tab_view(updated_players)
-        except Exception as e:
-            logger.debug('[PatchBattlePlayer] update failed: %s', e)
+                    tv = tv_ref() if tv_ref else None
+                    updated.append((player, tv))
 
-    def _force_refresh_tab_view(self, players):
-        dead = []
-        for ref in self._tab_view_instances:
-            tv = ref()
-            if tv is None:
-                dead.append(ref)
-                continue
-            for player in players:
-                try:
-                    if self._original_invalidate_personal_info:
-                        self._original_invalidate_personal_info(tv, player)
-                    elif hasattr(tv, '_invalidatePersonalInfo'):
-                        tv._invalidatePersonalInfo(player)
-                except Exception as e:
-                    logger.debug('[PatchBattlePlayer] force refresh failed: %s', e)
-        for ref in dead:
-            try:
-                self._tab_view_instances.remove(ref)
-            except ValueError:
-                pass
+            # Примусовий рефреш через modifyBattlePlayer або _invalidatePersonalInfo
+            for player, tv in updated:
+                if tv is not None:
+                    self._refresh_player(tv, player)
+        except Exception as e:
+            logger.debug('[PatchBattlePlayer] _on_stats_updated failed: %s', e)
+
+    def _refresh_player(self, tv, player):
+        """Тригерить оновлення DOM для конкретного гравця."""
+        try:
+            # Спосіб 1: modifyBattlePlayer — публічний API для модів
+            if hasattr(tv, 'modifyBattlePlayer'):
+                tv.modifyBattlePlayer(player)
+                return
+            # Спосіб 2: _invalidatePersonalInfo
+            if self._original_invalidate_personal_info:
+                self._original_invalidate_personal_info(tv, player)
+            elif hasattr(tv, '_invalidatePersonalInfo'):
+                tv._invalidatePersonalInfo(player)
+        except Exception as e:
+            logger.debug('[PatchBattlePlayer] _refresh_player failed: %s', e)
+
+    # ------------------------------------------------------------------
+    # BattlePlayer patch
+    # ------------------------------------------------------------------
 
     def _monkey_patch_battle_player(self):
         try:
@@ -196,6 +179,10 @@ class PatchBattlePlayer(object):
             logger.error('[PatchBattlePlayer] Traceback: %s', traceback.format_exc())
             return False
 
+    # ------------------------------------------------------------------
+    # TabView patch — патчимо обидва методи заповнення
+    # ------------------------------------------------------------------
+
     def _monkey_patch_tab_view(self):
         try:
             from gui.impl.battle.battle_page.tab_view import TabView
@@ -204,70 +191,52 @@ class PatchBattlePlayer(object):
             return False
 
         try:
-            # Діагностика — виводимо всі методи TabView
-            tab_methods = [m for m in dir(TabView) if not m.startswith('__')]
-            logger.debug('[PatchBattlePlayer] TabView methods: %s', tab_methods)
+            # Патчимо _fillPlayerModel
+            self._original_fill_player_model = TabView._fillPlayerModel
 
-            # Шукаємо правильний метод для заповнення моделі гравця
-            fill_method_name = None
-            for candidate in ('_fillPlayerModel', 'fillPlayerModel', '_fillPlayer',
-                              '_updatePlayer', '_addPlayer', '_buildPlayerModel'):
-                if hasattr(TabView, candidate):
-                    fill_method_name = candidate
-                    logger.debug('[PatchBattlePlayer] Found fill method: %s', candidate)
-                    break
-
-            if fill_method_name is None:
-                logger.error('[PatchBattlePlayer] No fill player method found in TabView!')
-                return False
-
-            self._original_fill_player_model = getattr(TabView, fill_method_name)
-
-            def patched_fill(tv_self, *args, **kwargs):
-                result = self._original_fill_player_model(tv_self, *args, **kwargs)
-                try:
+            @wraps(self._original_fill_player_model)
+            def patched_fill_player_model(tv_self, vehicleId, vehicleInfo):
+                player = self._original_fill_player_model(tv_self, vehicleId, vehicleInfo)
+                if player is not None:
                     self._register_tab_view_instance(tv_self)
-                    # args[0] — vehicleId, args[1] — vehicleInfo (якщо є)
-                    vehicleId = args[0] if args else kwargs.get('vehicleId')
-                    vehicleInfo = args[1] if len(args) > 1 else kwargs.get('vehicleInfo')
-                    player = result
-                    if player and vehicleId is not None:
-                        if vehicleInfo is None:
-                            # Спробуємо знайти vehicleInfo через інший шлях
-                            logger.debug('[PatchBattlePlayer] vehicleInfo is None for %s', vehicleId)
-                        self._active_players[vehicleId] = (player, vehicleInfo or {})
-                        self._set_values(player, vehicleInfo or {})
-                        logger.debug('[PatchBattlePlayer] Filled player model for vehicleId=%s', vehicleId)
-                except Exception as e:
-                    logger.debug('[PatchBattlePlayer] patched_fill error: %s', e)
-                return result
+                    tv_ref = weakref.ref(tv_self)
+                    self._active_players[vehicleId] = (player, vehicleInfo or {}, tv_ref)
+                    self._set_values(player, vehicleInfo or {})
+                    logger.debug('[PatchBattlePlayer] _fillPlayerModel vehicleId=%s', vehicleId)
+                return player
 
-            setattr(TabView, fill_method_name, patched_fill)
+            TabView._fillPlayerModel = patched_fill_player_model
 
-            # Патч invalidate
-            invalidate_name = None
-            for candidate in ('_invalidatePersonalInfo', 'invalidatePersonalInfo',
-                              '_invalidatePlayer', '_refreshPlayer'):
-                if hasattr(TabView, candidate):
-                    invalidate_name = candidate
-                    logger.debug('[PatchBattlePlayer] Found invalidate method: %s', candidate)
-                    break
+            # Патчимо _fillPlayerListModel якщо є
+            if hasattr(TabView, '_fillPlayerListModel'):
+                self._original_fill_player_list_model = TabView._fillPlayerListModel
 
-            if invalidate_name:
-                self._original_invalidate_personal_info = getattr(TabView, invalidate_name)
+                @wraps(self._original_fill_player_list_model)
+                def patched_fill_player_list_model(tv_self, *args, **kwargs):
+                    result = self._original_fill_player_list_model(tv_self, *args, **kwargs)
+                    self._register_tab_view_instance(tv_self)
+                    logger.debug('[PatchBattlePlayer] _fillPlayerListModel called')
+                    return result
 
+                TabView._fillPlayerListModel = patched_fill_player_list_model
+
+            # Патчимо _invalidatePersonalInfo
+            if hasattr(TabView, '_invalidatePersonalInfo'):
+                self._original_invalidate_personal_info = TabView._invalidatePersonalInfo
+
+                @wraps(self._original_invalidate_personal_info)
                 def patched_invalidate(tv_self, player):
                     self._original_invalidate_personal_info(tv_self, player)
                     try:
                         if hasattr(player, 'getVehicleId'):
-                            vehicleId = player.getVehicleId()
-                            if vehicleId and vehicleId in self._active_players:
-                                _, info = self._active_players[vehicleId]
-                                self._set_values(player, info)
+                            vid = player.getVehicleId()
+                            if vid and vid in self._active_players:
+                                p, info, _ = self._active_players[vid]
+                                self._set_values(p, info)
                     except Exception as e:
                         logger.debug('[PatchBattlePlayer] invalidate refresh failed: %s', e)
 
-                setattr(TabView, invalidate_name, patched_invalidate)
+                TabView._invalidatePersonalInfo = patched_invalidate
 
             logger.debug('[PatchBattlePlayer] TabView patched successfully')
             return True
@@ -287,16 +256,18 @@ class PatchBattlePlayer(object):
         except Exception as e:
             logger.debug('[PatchBattlePlayer] register instance failed: %s', e)
 
+    # ------------------------------------------------------------------
+    # Set stat values on BattlePlayer model
+    # ------------------------------------------------------------------
+
     def _set_values(self, player, vehicleInfo):
         try:
             account_id = vehicleInfo.get('accountDBID') if vehicleInfo else None
             if not account_id:
-                logger.debug('[PatchBattlePlayer] _set_values: no accountDBID in vehicleInfo')
                 return
 
             stats = self._stats_manager.get_cached_stats(account_id)
             if not stats:
-                logger.debug('[PatchBattlePlayer] _set_values: no cached stats for %s', account_id)
                 return
 
             wn8 = int(stats.get('wn8', 0) or 0)
@@ -335,6 +306,10 @@ class PatchBattlePlayer(object):
 
         except Exception as e:
             logger.debug('[PatchBattlePlayer] setValues failed: %s', e)
+
+    # ------------------------------------------------------------------
+    # Apply / remove
+    # ------------------------------------------------------------------
 
     def apply_patches(self):
         if self._patches_applied:
@@ -381,6 +356,8 @@ class PatchBattlePlayer(object):
 
             if self._original_fill_player_model:
                 TabView._fillPlayerModel = self._original_fill_player_model
+            if self._original_fill_player_list_model:
+                TabView._fillPlayerListModel = self._original_fill_player_list_model
             if self._original_invalidate_personal_info:
                 TabView._invalidatePersonalInfo = self._original_invalidate_personal_info
 
