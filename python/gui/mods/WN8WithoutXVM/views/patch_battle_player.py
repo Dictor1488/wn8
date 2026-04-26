@@ -1,4 +1,3 @@
-import inspect
 import weakref
 from functools import wraps
 
@@ -14,50 +13,29 @@ from ..settings.config_param import g_configParams
 import logging
 logger.setLevel(logging.DEBUG)
 
-EXTRA_FIELDS = (
-    'winrate',
-    'winrate_color',
-    'wn8',
-    'wn8_color',
-    'battles',
-    'battles_color',
-)
+# TAB/Gameface renders existing BattlePlayer fields reliably.
+# Adding custom WULF properties is fragile between WoT versions, so we pass
+# WN8 data through userName and decode it in TabView.js / DOM patch.
+ENCODE_SEPARATOR = u'\t'
 
 
 class PatchBattlePlayer(object):
 
     def __init__(self, stats_manager):
-        self._original_battle_player_constructor = None
-        self._original_battle_player_initialize = None
         self._original_fill_player_model = None
         self._original_invalidate_personal_info = None
         self._patches_applied = False
         self._stats_manager = stats_manager
+        # vehicleId -> (player, vehicleInfo, original_user_name, tab_view_ref)
         self._active_players = {}
         self._tab_view_instances = []
-        self._original_property_count = None
-        self._base_index = None
         stats_manager.add_update_callback(self._on_stats_updated)
-
-    def _discover_property_count(self, original_init):
-        try:
-            argspec = inspect.getargspec(original_init)
-            if argspec.defaults and 'properties' in argspec.args:
-                idx = argspec.args.index('properties') - 1
-                if 0 <= idx < len(argspec.defaults):
-                    self._original_property_count = argspec.defaults[idx]
-        except Exception as e:
-            logger.debug('[PatchBattlePlayer] inspect failed: %s', e)
-        if self._original_property_count is None:
-            self._original_property_count = 37
-        self._base_index = self._original_property_count
-        logger.debug('[PatchBattlePlayer] base_index=%s', self._base_index)
 
     def _on_stats_updated(self, account_id):
         try:
-            for vid, (player, info, tv_ref) in list(self._active_players.items()):
+            for vid, (player, info, original_user_name, tv_ref) in list(self._active_players.items()):
                 if info.get('accountDBID') == account_id:
-                    self._set_values(player, info)
+                    self._set_encoded_name(player, info, original_user_name)
                     tv = tv_ref() if tv_ref else None
                     if tv is not None:
                         try:
@@ -67,85 +45,57 @@ class PatchBattlePlayer(object):
         except Exception as e:
             logger.debug('[PatchBattlePlayer] update failed: %s', e)
 
+    def _decode_original_name(self, user_name):
+        try:
+            if user_name and ENCODE_SEPARATOR in user_name:
+                return user_name.split(ENCODE_SEPARATOR, 1)[0]
+        except Exception:
+            pass
+        return user_name or u''
+
+    def _set_encoded_name(self, player, vehicleInfo, original_user_name):
+        try:
+            account_id = vehicleInfo.get('accountDBID') if vehicleInfo else None
+            if not account_id:
+                return
+
+            stats = self._stats_manager.get_cached_stats(account_id)
+            if not stats:
+                return
+
+            wn8 = int(stats.get('wn8', 0) or 0)
+            winrate = float(stats.get('winrate', 0) or 0)
+            battles = int(stats.get('battles', 0) or 0)
+
+            wn8_text = str(wn8) if g_configParams.showWn8.value and wn8 else ''
+            wn8_color = get_wn8_color(wn8) if wn8 else '#FFFFFF'
+            winrate_text = ('%.1f' % winrate) if g_configParams.showWinrate.value and winrate else ''
+            winrate_color = get_winrate_color(winrate) if winrate else '#FFFFFF'
+            battles_text = get_format_battles(battles) if g_configParams.showBattles.value and battles else ''
+            battles_color = get_battles_color(battles) if battles else '#FFFFFF'
+
+            encoded = ENCODE_SEPARATOR.join((
+                original_user_name or u'',
+                wn8_text,
+                wn8_color,
+                winrate_text,
+                winrate_color,
+                battles_text,
+                battles_color,
+            ))
+
+            if hasattr(player, 'setUserName'):
+                player.setUserName(encoded)
+                logger.debug('[PatchBattlePlayer] encoded TAB stats set wn8=%s wr=%s battles=%s for %s',
+                             wn8_text, winrate_text, battles_text, account_id)
+        except Exception as e:
+            logger.debug('[PatchBattlePlayer] _set_encoded_name failed: %s', e)
+
     def _monkey_patch_battle_player(self):
-        try:
-            from gui.impl.gen.view_models.common.battle_player import BattlePlayer
-        except Exception as e:
-            logger.error('[PatchBattlePlayer] BattlePlayer import failed: %s', e)
-            return False
-
-        try:
-            self._original_battle_player_constructor = BattlePlayer.__init__
-            self._original_battle_player_initialize = BattlePlayer._initialize
-            self._discover_property_count(self._original_battle_player_constructor)
-
-            extra = len(EXTRA_FIELDS)
-            base_count = self._original_property_count
-            patch_ref = self
-
-            def patched_constructor(bp_self, properties=None, commands=0):
-                total = (properties + extra) if (properties is not None and properties != base_count) else (base_count + extra)
-                try:
-                    patch_ref._original_battle_player_constructor(bp_self, properties=total, commands=commands)
-                except Exception:
-                    patch_ref._original_battle_player_constructor(bp_self, commands=commands)
-
-            def patched_initialize(bp_self):
-                try:
-                    patch_ref._original_battle_player_initialize(bp_self)
-                except Exception:
-                    return
-                # Реєструємо поля в C++ schema
-                # ВАЖЛИВО: оригінальний _initialize реєструє 37 полів і витрачає слоти 0-36
-                # Ми передали properties=43, тому слоти 37-42 вільні
-                # _addStringProperty має їх зайняти
-                try:
-                    for field in EXTRA_FIELDS:
-                        default = '#FFFFFF' if field.endswith('_color') else ''
-                        result = bp_self._addStringProperty(field, default)
-                        logger.debug('[PatchBattlePlayer] _addStringProperty(%s)=%s type=%s',
-                                     field, result, type(result).__name__)
-                    # Перевіряємо чи поля доступні через __dict__ або dir
-                    all_attrs = [a for a in dir(bp_self) if 'wn8' in a.lower() or 'winrate' in a.lower() or 'battles' in a.lower()]
-                    logger.debug('[PatchBattlePlayer] wn8-related attrs after add: %s', all_attrs)
-                except Exception as e:
-                    logger.debug('[PatchBattlePlayer] addStringProperty failed: %s', e)
-
-            BattlePlayer.__init__ = patched_constructor
-            BattlePlayer._initialize = patched_initialize
-
-            # Додаємо set/get через _setString/_getString за offset
-            def make_getter(offset):
-                def getter(self_):
-                    try:
-                        return self_._getString(patch_ref._base_index + offset)
-                    except Exception:
-                        return ''
-                return getter
-
-            def make_setter(offset):
-                def setter(self_, value):
-                    try:
-                        self_._setString(patch_ref._base_index + offset, value if value else '')
-                    except Exception:
-                        pass
-                return setter
-
-            for method_name, offset in (
-                ('Winrate', 0), ('WinrateColor', 1),
-                ('Wn8', 2), ('Wn8Color', 3),
-                ('Battles', 4), ('BattlesColor', 5),
-            ):
-                setattr(BattlePlayer, 'get' + method_name, make_getter(offset))
-                setattr(BattlePlayer, 'set' + method_name, make_setter(offset))
-
-            logger.debug('[PatchBattlePlayer] BattlePlayer patched (base=%s extras=%s)', base_count, extra)
-            return True
-        except Exception as e:
-            logger.error('[PatchBattlePlayer] BattlePlayer patch failed: %s', e)
-            import traceback
-            logger.error('[PatchBattlePlayer] %s', traceback.format_exc())
-            return False
+        # No BattlePlayer schema extension here. Existing userName is safer and
+        # survives client-side model changes better than _addStringProperty slots.
+        logger.debug('[PatchBattlePlayer] Using encoded userName transport')
+        return True
 
     def _monkey_patch_tab_view(self):
         try:
@@ -163,8 +113,14 @@ class PatchBattlePlayer(object):
                 if player is not None:
                     self._register_tab_view_instance(tv_self)
                     tv_ref = weakref.ref(tv_self)
-                    self._active_players[vehicleId] = (player, vehicleInfo or {}, tv_ref)
-                    self._set_values(player, vehicleInfo or {})
+                    original_user_name = u''
+                    try:
+                        if hasattr(player, 'getUserName'):
+                            original_user_name = self._decode_original_name(player.getUserName() or u'')
+                    except Exception:
+                        original_user_name = u''
+                    self._active_players[vehicleId] = (player, vehicleInfo or {}, original_user_name, tv_ref)
+                    self._set_encoded_name(player, vehicleInfo or {}, original_user_name)
                 return player
 
             TabView._fillPlayerModel = patched_fill_player_model
@@ -179,14 +135,14 @@ class PatchBattlePlayer(object):
                         if hasattr(player, 'getVehicleId'):
                             vid = player.getVehicleId()
                             if vid and vid in self._active_players:
-                                p, info, _ = self._active_players[vid]
-                                self._set_values(p, info)
+                                p, info, original_user_name, _ = self._active_players[vid]
+                                self._set_encoded_name(p, info, original_user_name)
                     except Exception as e:
                         logger.debug('[PatchBattlePlayer] invalidate: %s', e)
 
                 TabView._invalidatePersonalInfo = patched_invalidate
 
-            logger.debug('[PatchBattlePlayer] TabView patched')
+            logger.debug('[PatchBattlePlayer] TabView patched with encoded userName')
             return True
         except Exception as e:
             logger.error('[PatchBattlePlayer] TabView patch failed: %s', e)
@@ -202,36 +158,6 @@ class PatchBattlePlayer(object):
             self._tab_view_instances.append(weakref.ref(tv_self))
         except Exception:
             pass
-
-    def _set_values(self, player, vehicleInfo):
-        try:
-            account_id = vehicleInfo.get('accountDBID') if vehicleInfo else None
-            if not account_id:
-                return
-            stats = self._stats_manager.get_cached_stats(account_id)
-            if not stats:
-                return
-
-            wn8 = int(stats.get('wn8', 0) or 0)
-            winrate = float(stats.get('winrate', 0) or 0)
-            battles = int(stats.get('battles', 0) or 0)
-
-            if hasattr(player, 'setWn8Color'):
-                player.setWn8Color(get_wn8_color(wn8) if wn8 else '#FFFFFF')
-            if hasattr(player, 'setWinrateColor'):
-                player.setWinrateColor(get_winrate_color(winrate) if winrate else '#FFFFFF')
-            if hasattr(player, 'setBattlesColor'):
-                player.setBattlesColor(get_battles_color(battles) if battles else '#FFFFFF')
-            if hasattr(player, 'setWn8'):
-                player.setWn8(str(wn8) if g_configParams.showWn8.value and wn8 else '')
-            if hasattr(player, 'setWinrate'):
-                player.setWinrate('%.1f%%' % winrate if g_configParams.showWinrate.value and winrate else '')
-            if hasattr(player, 'setBattles'):
-                player.setBattles(get_format_battles(battles) if g_configParams.showBattles.value and battles else '')
-
-            logger.debug('[PatchBattlePlayer] values set wn8=%s for %s', wn8, account_id)
-        except Exception as e:
-            logger.debug('[PatchBattlePlayer] _set_values failed: %s', e)
 
     def apply_patches(self):
         if self._patches_applied:
@@ -257,21 +183,7 @@ class PatchBattlePlayer(object):
                 self._tab_view_instances = []
                 return True
 
-            from gui.impl.gen.view_models.common.battle_player import BattlePlayer
             from gui.impl.battle.battle_page.tab_view import TabView
-
-            if self._original_battle_player_constructor:
-                BattlePlayer.__init__ = self._original_battle_player_constructor
-            if self._original_battle_player_initialize:
-                BattlePlayer._initialize = self._original_battle_player_initialize
-                for m in ('getWinrate','setWinrate','getWinrateColor','setWinrateColor',
-                          'getWn8','setWn8','getWn8Color','setWn8Color',
-                          'getBattles','setBattles','getBattlesColor','setBattlesColor'):
-                    if hasattr(BattlePlayer, m):
-                        try:
-                            delattr(BattlePlayer, m)
-                        except AttributeError:
-                            pass
 
             if self._original_fill_player_model:
                 TabView._fillPlayerModel = self._original_fill_player_model
