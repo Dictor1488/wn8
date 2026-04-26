@@ -1,118 +1,142 @@
-import weakref
+import inspect
 from functools import wraps
 
-from ..utils import logger
+from ..utils import (
+    logger,
+    get_wn8_color,
+    get_winrate_color,
+    get_battles_color,
+    get_format_battles
+)
 from ..settings.config_param import g_configParams
 
-import logging
-logger.setLevel(logging.DEBUG)
+
+EXTRA_FIELDS = (
+    'winrate',
+    'winrate_color',
+    'wn8',
+    'wn8_color',
+    'battles',
+    'battles_color',
+)
 
 
 class PatchBattlePlayer(object):
     """
-    Reliable TAB stats patch.
+    TAB stats patch through BattlePlayer extra fields.
 
-    Do not touch userName: in current Gameface TAB it breaks visible nick/clan
-    layout. Stats are written only into vehicleName, which is known to be
-    rendered in TAB. Keep the prefix compact so vehicle names stay readable.
+    Important: do not modify userName or vehicleName here. Those fields are
+    rendered by the stock TAB layout and changing them breaks visible nick/clan
+    or vehicle names. TabView.js should read the extra fields below.
     """
 
     def __init__(self, stats_manager):
+        self._original_battle_player_constructor = None
+        self._original_battle_player_initialize = None
         self._original_fill_player_model = None
         self._original_invalidate_personal_info = None
         self._patches_applied = False
         self._stats_manager = stats_manager
-        # vehicleId -> (player, vehicleInfo, original_vehicle_name, tab_view_ref)
         self._active_players = {}
-        self._tab_view_instances = []
+        self._original_property_count = None
+        self._base_index = None
         stats_manager.add_update_callback(self._on_stats_updated)
+
+    def _discover_property_count(self, original_init):
+        try:
+            argspec = inspect.getargspec(original_init)
+            if argspec.defaults and 'properties' in argspec.args:
+                idx = argspec.args.index('properties') - 1
+                if 0 <= idx < len(argspec.defaults):
+                    self._original_property_count = argspec.defaults[idx]
+        except Exception as e:
+            logger.debug('[PatchBattlePlayer] property discovery failed: %s', e)
+
+        if self._original_property_count is None:
+            self._original_property_count = 37
+        self._base_index = self._original_property_count
+        logger.debug('[PatchBattlePlayer] base_index=%s', self._base_index)
+
+    def _make_getter(self, offset):
+        def getter(self_):
+            try:
+                return self_._getString(self._base_index + offset)
+            except Exception:
+                return ''
+        return getter
+
+    def _make_setter(self, offset):
+        def setter(self_, value):
+            try:
+                self_._setString(self._base_index + offset, value if value else '')
+            except Exception:
+                pass
+        return setter
 
     def _on_stats_updated(self, account_id):
         try:
-            for vid, (player, info, original_vehicle_name, tv_ref) in list(self._active_players.items()):
-                if info.get('accountDBID') == account_id:
-                    self._set_tab_vehicle_name(player, info, original_vehicle_name)
-                    tv = tv_ref() if tv_ref else None
-                    if tv is not None:
-                        try:
-                            tv.modifyBattlePlayer(player)
-                        except Exception:
-                            pass
+            for vehicle_id, (player, vehicle_info) in list(self._active_players.items()):
+                if vehicle_info.get('accountDBID') == account_id:
+                    self._set_values(player, vehicle_info)
         except Exception as e:
             logger.debug('[PatchBattlePlayer] update failed: %s', e)
 
-    def _strip_old_stats_prefix(self, text):
-        try:
-            value = text or u''
-            if value.startswith(u'[') and u'] ' in value:
-                return value.split(u'] ', 1)[1]
-            return value
-        except Exception:
-            return text or u''
-
-    def _to_unicode(self, value):
-        try:
-            if isinstance(value, unicode):
-                return value
-            return unicode(value)
-        except Exception:
-            try:
-                return str(value)
-            except Exception:
-                return u''
-
-    def _build_stats_prefix(self, stats):
-        """Compact TAB prefix: WN8/WR only. Battles are too long for TAB."""
-        wn8_text = u''
-        wr_text = u''
-        try:
-            if g_configParams.showWn8.value:
-                wn8 = int(stats.get('wn8', 0) or 0)
-                if wn8:
-                    wn8_text = self._to_unicode(wn8)
-        except Exception:
-            pass
-        try:
-            if g_configParams.showWinrate.value:
-                winrate = float(stats.get('winrate', 0) or 0)
-                if winrate:
-                    wr_text = self._to_unicode(int(round(winrate)))
-        except Exception:
-            pass
-
-        if wn8_text and wr_text:
-            return u'%s/%s' % (wn8_text, wr_text)
-        if wn8_text:
-            return wn8_text
-        if wr_text:
-            return wr_text
-        return u''
-
-    def _set_tab_vehicle_name(self, player, vehicleInfo, original_vehicle_name):
-        try:
-            account_id = vehicleInfo.get('accountDBID') if vehicleInfo else None
-            if not account_id:
-                return
-
-            stats = self._stats_manager.get_cached_stats(account_id)
-            if not stats:
-                return
-
-            prefix = self._build_stats_prefix(stats)
-            clean_vehicle = self._strip_old_stats_prefix(original_vehicle_name)
-            display_vehicle = u'[%s] %s' % (prefix, clean_vehicle) if prefix else clean_vehicle
-
-            if hasattr(player, 'setVehicleName'):
-                player.setVehicleName(display_vehicle)
-                logger.debug('[PatchBattlePlayer] TAB vehicle set for %s: %s', account_id, display_vehicle)
-            else:
-                logger.debug('[PatchBattlePlayer] setVehicleName not found')
-        except Exception as e:
-            logger.debug('[PatchBattlePlayer] _set_tab_vehicle_name failed: %s', e)
-
     def _monkey_patch_battle_player(self):
-        logger.debug('[PatchBattlePlayer] Using compact vehicleName TAB stats transport')
-        return True
+        try:
+            from gui.impl.gen.view_models.common.battle_player import BattlePlayer
+        except Exception as e:
+            logger.error('[PatchBattlePlayer] BattlePlayer import failed: %s', e)
+            return False
+
+        try:
+            self._original_battle_player_constructor = BattlePlayer.__init__
+            self._original_battle_player_initialize = BattlePlayer._initialize
+            self._discover_property_count(self._original_battle_player_constructor)
+
+            extra = len(EXTRA_FIELDS)
+            base_count = self._original_property_count
+
+            def patched_constructor(bp_self, properties=None, commands=0):
+                if properties is not None and properties != base_count:
+                    total = properties + extra
+                else:
+                    total = base_count + extra
+                try:
+                    self._original_battle_player_constructor(bp_self, properties=total, commands=commands)
+                except Exception:
+                    self._original_battle_player_constructor(bp_self, commands=commands)
+
+            def patched_initialize(bp_self):
+                try:
+                    self._original_battle_player_initialize(bp_self)
+                except Exception:
+                    return
+                try:
+                    for field in EXTRA_FIELDS:
+                        default = '#FFFFFF' if field.endswith('_color') else ''
+                        bp_self._addStringProperty(field, default)
+                except Exception as e:
+                    logger.debug('[PatchBattlePlayer] addStringProperty failed: %s', e)
+
+            BattlePlayer.__init__ = patched_constructor
+            BattlePlayer._initialize = patched_initialize
+
+            method_pairs = (
+                ('Winrate', 0), ('WinrateColor', 1),
+                ('Wn8', 2), ('Wn8Color', 3),
+                ('Battles', 4), ('BattlesColor', 5),
+            )
+            for method_name, offset in method_pairs:
+                setattr(BattlePlayer, 'get' + method_name, self._make_getter(offset))
+                setattr(BattlePlayer, 'set' + method_name, self._make_setter(offset))
+
+            logger.debug('[PatchBattlePlayer] BattlePlayer patched (base=%s, extras=%s)', base_count, extra)
+            return True
+        except Exception as e:
+            logger.error('[PatchBattlePlayer] BattlePlayer patch failed: %s', e)
+            import traceback
+            logger.error('[PatchBattlePlayer] Traceback: %s', traceback.format_exc())
+            return False
 
     def _monkey_patch_tab_view(self):
         try:
@@ -127,17 +151,9 @@ class PatchBattlePlayer(object):
             @wraps(self._original_fill_player_model)
             def patched_fill_player_model(tv_self, vehicleId, vehicleInfo):
                 player = self._original_fill_player_model(tv_self, vehicleId, vehicleInfo)
-                if player is not None:
-                    self._register_tab_view_instance(tv_self)
-                    tv_ref = weakref.ref(tv_self)
-                    original_vehicle_name = u''
-                    try:
-                        if hasattr(player, 'getVehicleName'):
-                            original_vehicle_name = self._strip_old_stats_prefix(player.getVehicleName() or u'')
-                    except Exception:
-                        original_vehicle_name = u''
-                    self._active_players[vehicleId] = (player, vehicleInfo or {}, original_vehicle_name, tv_ref)
-                    self._set_tab_vehicle_name(player, vehicleInfo or {}, original_vehicle_name)
+                if player and vehicleInfo:
+                    self._active_players[vehicleId] = (player, vehicleInfo)
+                    self._set_values(player, vehicleInfo)
                 return player
 
             TabView._fillPlayerModel = patched_fill_player_model
@@ -146,35 +162,64 @@ class PatchBattlePlayer(object):
                 self._original_invalidate_personal_info = TabView._invalidatePersonalInfo
 
                 @wraps(self._original_invalidate_personal_info)
-                def patched_invalidate(tv_self, player):
+                def patched_invalidate_personal_info(tv_self, player):
                     self._original_invalidate_personal_info(tv_self, player)
                     try:
                         if hasattr(player, 'getVehicleId'):
-                            vid = player.getVehicleId()
-                            if vid and vid in self._active_players:
-                                p, info, original_vehicle_name, _ = self._active_players[vid]
-                                self._set_tab_vehicle_name(p, info, original_vehicle_name)
+                            vehicleId = player.getVehicleId()
+                            if vehicleId and vehicleId in self._active_players:
+                                _, info = self._active_players[vehicleId]
+                                self._set_values(player, info)
                     except Exception as e:
-                        logger.debug('[PatchBattlePlayer] invalidate: %s', e)
+                        logger.debug('[PatchBattlePlayer] invalidate refresh failed: %s', e)
 
-                TabView._invalidatePersonalInfo = patched_invalidate
+                TabView._invalidatePersonalInfo = patched_invalidate_personal_info
 
-            logger.debug('[PatchBattlePlayer] TabView patched with compact vehicleName stats')
+            logger.debug('[PatchBattlePlayer] TabView patched')
             return True
         except Exception as e:
             logger.error('[PatchBattlePlayer] TabView patch failed: %s', e)
             import traceback
-            logger.error('[PatchBattlePlayer] %s', traceback.format_exc())
+            logger.error('[PatchBattlePlayer] Traceback: %s', traceback.format_exc())
             return False
 
-    def _register_tab_view_instance(self, tv_self):
+    def _set_values(self, player, vehicleInfo):
         try:
-            for ref in self._tab_view_instances:
-                if ref() is tv_self:
-                    return
-            self._tab_view_instances.append(weakref.ref(tv_self))
-        except Exception:
-            pass
+            account_id = vehicleInfo.get('accountDBID') if vehicleInfo else None
+            if not account_id:
+                return
+
+            stats = self._stats_manager.get_cached_stats(account_id)
+            if not stats:
+                return
+
+            wn8 = int(stats.get('wn8', 0) or 0)
+            winrate = float(stats.get('winrate', 0) or 0)
+            battles = int(stats.get('battles', 0) or 0)
+
+            wn8_color = get_wn8_color(wn8) if wn8 else '#FFFFFF'
+            wr_color = get_winrate_color(winrate) if winrate else '#FFFFFF'
+            b_color = get_battles_color(battles) if battles else '#FFFFFF'
+
+            if hasattr(player, 'setWn8Color'):
+                player.setWn8Color(wn8_color)
+            if hasattr(player, 'setWinrateColor'):
+                player.setWinrateColor(wr_color)
+            if hasattr(player, 'setBattlesColor'):
+                player.setBattlesColor(b_color)
+
+            if hasattr(player, 'setWn8'):
+                player.setWn8(str(wn8) if g_configParams.showWn8.value and wn8 else '')
+            if hasattr(player, 'setWinrate'):
+                # Keep percent here. TabView.js should display this field directly.
+                player.setWinrate('%.1f%%' % winrate if g_configParams.showWinrate.value and winrate else '')
+            if hasattr(player, 'setBattles'):
+                player.setBattles(get_format_battles(battles) if g_configParams.showBattles.value and battles else '')
+
+            logger.debug('[PatchBattlePlayer] values set acc=%s wn8=%s wr=%.1f battles=%s',
+                         account_id, wn8, winrate, battles)
+        except Exception as e:
+            logger.debug('[PatchBattlePlayer] setValues failed: %s', e)
 
     def apply_patches(self):
         if self._patches_applied:
@@ -185,22 +230,37 @@ class PatchBattlePlayer(object):
         if self._monkey_patch_tab_view():
             success += 1
         self._patches_applied = success == 2
-        logger.debug('[PatchBattlePlayer] apply: %s/2', success)
         return self._patches_applied
 
     def remove_patches(self):
         try:
-            if self._stats_manager:
-                try:
+            try:
+                if self._stats_manager is not None:
                     self._stats_manager.remove_update_callback(self._on_stats_updated)
-                except Exception:
-                    pass
+            except Exception as e:
+                logger.debug('[PatchBattlePlayer] callback unsubscribe failed: %s', e)
+
             if not self._patches_applied:
                 self._active_players.clear()
-                self._tab_view_instances = []
                 return True
 
+            from gui.impl.gen.view_models.common.battle_player import BattlePlayer
             from gui.impl.battle.battle_page.tab_view import TabView
+
+            if self._original_battle_player_constructor:
+                BattlePlayer.__init__ = self._original_battle_player_constructor
+            if self._original_battle_player_initialize:
+                BattlePlayer._initialize = self._original_battle_player_initialize
+                for method_name in (
+                    'getWinrate', 'setWinrate', 'getWinrateColor', 'setWinrateColor',
+                    'getWn8', 'setWn8', 'getWn8Color', 'setWn8Color',
+                    'getBattles', 'setBattles', 'getBattlesColor', 'setBattlesColor',
+                ):
+                    if hasattr(BattlePlayer, method_name):
+                        try:
+                            delattr(BattlePlayer, method_name)
+                        except AttributeError:
+                            pass
 
             if self._original_fill_player_model:
                 TabView._fillPlayerModel = self._original_fill_player_model
@@ -208,7 +268,6 @@ class PatchBattlePlayer(object):
                 TabView._invalidatePersonalInfo = self._original_invalidate_personal_info
 
             self._active_players.clear()
-            self._tab_view_instances = []
             self._patches_applied = False
             return True
         except Exception as e:
