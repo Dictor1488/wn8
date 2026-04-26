@@ -2635,3 +2635,18 @@
 .UserInfo_userNameWrapper_ddc08 {
     min-width: 0;
 }
+
+/* WN8WithoutXVM TAB stats v6: allies stats left of nick, enemies stats right of nick */
+.WN8TabStats {
+    order: 0 !important;
+    flex: 0 0 auto;
+    margin: -1rem 4rem 0 0;
+}
+.WN8TabStats_right {
+    order: 0 !important;
+    flex-direction: row;
+    margin: -1rem 0 0 4rem;
+}
+.UserInfo_userNameWrapper_ddc08 {
+    min-width: 0;
+}
