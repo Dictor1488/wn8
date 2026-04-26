@@ -14,10 +14,21 @@ from ..settings.config_param import g_configParams
 import logging
 logger.setLevel(logging.DEBUG)
 
+EXTRA_FIELDS = (
+    'winrate',
+    'winrate_color',
+    'wn8',
+    'wn8_color',
+    'battles',
+    'battles_color',
+)
+
 
 class PatchBattlePlayer(object):
 
     def __init__(self, stats_manager):
+        self._original_battle_player_constructor = None
+        self._original_battle_player_initialize = None
         self._original_fill_player_model = None
         self._original_fill_player_list_model = None
         self._original_invalidate_personal_info = None
@@ -25,13 +36,33 @@ class PatchBattlePlayer(object):
         self._stats_manager = stats_manager
         self._active_players = {}
         self._tab_view_instances = []
+        self._original_property_count = None
+        self._base_index = None
+        # vehicleId -> property_index_map (field_name -> property_index)
+        self._player_prop_indices = {}
         stats_manager.add_update_callback(self._on_stats_updated)
+
+    def _discover_property_count(self, original_init):
+        try:
+            argspec = inspect.getargspec(original_init)
+            if argspec.defaults and 'properties' in argspec.args:
+                idx = argspec.args.index('properties') - 1
+                if 0 <= idx < len(argspec.defaults):
+                    self._original_property_count = argspec.defaults[idx]
+        except Exception as e:
+            logger.debug('[PatchBattlePlayer] inspect failed: %s', e)
+
+        if self._original_property_count is None:
+            self._original_property_count = 37
+
+        self._base_index = self._original_property_count
+        logger.debug('[PatchBattlePlayer] base_index=%s', self._base_index)
 
     def _on_stats_updated(self, account_id):
         try:
-            for vehicle_id, (player, vehicle_info, tv_ref) in list(self._active_players.items()):
+            for vehicle_id, (player, vehicle_info, tv_ref, prop_map) in list(self._active_players.items()):
                 if vehicle_info.get('accountDBID') == account_id:
-                    self._set_values(player, vehicle_info)
+                    self._set_values(player, vehicle_info, prop_map)
                     tv = tv_ref() if tv_ref else None
                     if tv is not None:
                         self._refresh_player(tv, player)
@@ -42,33 +73,106 @@ class PatchBattlePlayer(object):
         try:
             if hasattr(tv, 'modifyBattlePlayer'):
                 tv.modifyBattlePlayer(player)
-                logger.debug('[PatchBattlePlayer] modifyBattlePlayer called')
             elif self._original_invalidate_personal_info:
                 self._original_invalidate_personal_info(tv, player)
         except Exception as e:
             logger.debug('[PatchBattlePlayer] _refresh_player failed: %s', e)
 
     def _monkey_patch_battle_player(self):
-        """
-        НЕ патчимо BattlePlayer.__init__ і _initialize.
-        Перевіряємо чи WG вже додали wn8/winrate/battles поля напряму.
-        """
         try:
             from gui.impl.gen.view_models.common.battle_player import BattlePlayer
-            # Діагностика: виводимо всі getter методи оригінального класу
-            getters = [m for m in dir(BattlePlayer) if m.startswith('get') and callable(getattr(BattlePlayer, m))]
-            logger.debug('[PatchBattlePlayer] BattlePlayer getters: %s', getters)
+        except Exception as e:
+            logger.error('[PatchBattlePlayer] BattlePlayer import failed: %s', e)
+            return False
 
-            # Перевіряємо чи вже є наші поля
-            has_wn8 = hasattr(BattlePlayer, 'getWn8') or hasattr(BattlePlayer, 'getWN8')
-            has_winrate = hasattr(BattlePlayer, 'getWinrate') or hasattr(BattlePlayer, 'getWinRate')
-            has_battles = hasattr(BattlePlayer, 'getBattles')
-            logger.debug('[PatchBattlePlayer] has_wn8=%s has_winrate=%s has_battles=%s',
-                         has_wn8, has_winrate, has_battles)
+        try:
+            self._original_battle_player_constructor = BattlePlayer.__init__
+            self._original_battle_player_initialize = BattlePlayer._initialize
+            self._discover_property_count(self._original_battle_player_constructor)
 
+            extra = len(EXTRA_FIELDS)
+            base_count = self._original_property_count
+            patch_self = self
+
+            def patched_constructor(bp_self, properties=None, commands=0):
+                total = (properties + extra) if (properties is not None and properties != base_count) else (base_count + extra)
+                try:
+                    patch_self._original_battle_player_constructor(bp_self, properties=total, commands=commands)
+                except Exception:
+                    patch_self._original_battle_player_constructor(bp_self, commands=commands)
+
+            def patched_initialize(bp_self):
+                try:
+                    patch_self._original_battle_player_initialize(bp_self)
+                except Exception:
+                    return
+                try:
+                    prop_map = {}
+                    for field in EXTRA_FIELDS:
+                        default = '#FFFFFF' if field.endswith('_color') else ''
+                        idx = bp_self._addStringProperty(field, default)
+                        prop_map[field] = idx
+                        logger.debug('[PatchBattlePlayer] _addStringProperty(%s) -> index=%s', field, idx)
+
+                    # Зберігаємо prop_map на самому об'єкті для подальшого використання
+                    object.__setattr__(bp_self, '_wn8_prop_map', prop_map)
+                except Exception as e:
+                    logger.debug('[PatchBattlePlayer] addStringProperty failed: %s', e)
+
+            BattlePlayer.__init__ = patched_constructor
+            BattlePlayer._initialize = patched_initialize
+
+            # Додаємо методи що використовують prop_map або _setString за індексом
+            def make_name_setter(field_name):
+                def setter(bp_self, value):
+                    try:
+                        # Спосіб 1: через prop_map + _setPropertyByIndex якщо є
+                        prop_map = object.__getattribute__(bp_self, '_wn8_prop_map') if hasattr(bp_self, '_wn8_prop_map') else {}
+                        if field_name in prop_map and prop_map[field_name] is not None:
+                            idx = prop_map[field_name]
+                            if hasattr(bp_self, '_setPropertyByIndex'):
+                                bp_self._setPropertyByIndex(idx, value or '')
+                                return
+                        # Спосіб 2: _setString за offset
+                        offset = EXTRA_FIELDS.index(field_name)
+                        bp_self._setString(patch_self._base_index + offset, value or '')
+                    except Exception as e:
+                        logger.debug('[PatchBattlePlayer] setter %s failed: %s', field_name, e)
+                return setter
+
+            def make_name_getter(field_name):
+                def getter(bp_self):
+                    try:
+                        prop_map = object.__getattribute__(bp_self, '_wn8_prop_map') if hasattr(bp_self, '_wn8_prop_map') else {}
+                        if field_name in prop_map and prop_map[field_name] is not None:
+                            idx = prop_map[field_name]
+                            if hasattr(bp_self, '_getPropertyByIndex'):
+                                return bp_self._getPropertyByIndex(idx)
+                        offset = EXTRA_FIELDS.index(field_name)
+                        return bp_self._getString(patch_self._base_index + offset)
+                    except Exception:
+                        return ''
+                return getter
+
+            method_map = {
+                'winrate': ('Winrate', 'setWinrate', 'getWinrate'),
+                'winrate_color': ('WinrateColor', 'setWinrateColor', 'getWinrateColor'),
+                'wn8': ('Wn8', 'setWn8', 'getWn8'),
+                'wn8_color': ('Wn8Color', 'setWn8Color', 'getWn8Color'),
+                'battles': ('Battles', 'setBattles', 'getBattles'),
+                'battles_color': ('BattlesColor', 'setBattlesColor', 'getBattlesColor'),
+            }
+
+            for field, (cap, setter_name, getter_name) in method_map.items():
+                setattr(BattlePlayer, setter_name, make_name_setter(field))
+                setattr(BattlePlayer, getter_name, make_name_getter(field))
+
+            logger.debug('[PatchBattlePlayer] BattlePlayer patched (base=%s, extras=%s)', base_count, extra)
             return True
         except Exception as e:
-            logger.error('[PatchBattlePlayer] BattlePlayer check failed: %s', e)
+            logger.error('[PatchBattlePlayer] BattlePlayer patch failed: %s', e)
+            import traceback
+            logger.error('[PatchBattlePlayer] Traceback: %s', traceback.format_exc())
             return False
 
     def _monkey_patch_tab_view(self):
@@ -87,15 +191,9 @@ class PatchBattlePlayer(object):
                 if player is not None:
                     self._register_tab_view_instance(tv_self)
                     tv_ref = weakref.ref(tv_self)
-                    self._active_players[vehicleId] = (player, vehicleInfo or {}, tv_ref)
-                    # Діагностика: виводимо всі атрибути player
-                    if vehicleInfo and vehicleInfo.get('accountDBID') == list(self._active_players.values())[0][1].get('accountDBID') if self._active_players else False:
-                        pass
-                    self._set_values(player, vehicleInfo or {})
-                    # ДІАГНОСТИКА: виводимо всі getter методи першого гравця
-                    if len(self._active_players) == 1:
-                        getters = [m for m in dir(player) if m.startswith('get') and callable(getattr(player, m, None))]
-                        logger.debug('[PatchBattlePlayer] BattlePlayer instance getters: %s', getters)
+                    prop_map = getattr(player, '_wn8_prop_map', {}) if hasattr(player, '_wn8_prop_map') else {}
+                    self._active_players[vehicleId] = (player, vehicleInfo or {}, tv_ref, prop_map)
+                    self._set_values(player, vehicleInfo or {}, prop_map)
                 return player
 
             TabView._fillPlayerModel = patched_fill_player_model
@@ -104,12 +202,12 @@ class PatchBattlePlayer(object):
                 self._original_fill_player_list_model = TabView._fillPlayerListModel
 
                 @wraps(self._original_fill_player_list_model)
-                def patched_fill_player_list_model(tv_self, *args, **kwargs):
+                def patched_fill_list(tv_self, *args, **kwargs):
                     result = self._original_fill_player_list_model(tv_self, *args, **kwargs)
                     self._register_tab_view_instance(tv_self)
                     return result
 
-                TabView._fillPlayerListModel = patched_fill_player_list_model
+                TabView._fillPlayerListModel = patched_fill_list
 
             if hasattr(TabView, '_invalidatePersonalInfo'):
                 self._original_invalidate_personal_info = TabView._invalidatePersonalInfo
@@ -121,8 +219,8 @@ class PatchBattlePlayer(object):
                         if hasattr(player, 'getVehicleId'):
                             vid = player.getVehicleId()
                             if vid and vid in self._active_players:
-                                p, info, _ = self._active_players[vid]
-                                self._set_values(p, info)
+                                p, info, _, prop_map = self._active_players[vid]
+                                self._set_values(p, info, prop_map)
                     except Exception as e:
                         logger.debug('[PatchBattlePlayer] invalidate refresh failed: %s', e)
 
@@ -145,7 +243,7 @@ class PatchBattlePlayer(object):
         except Exception:
             pass
 
-    def _set_values(self, player, vehicleInfo):
+    def _set_values(self, player, vehicleInfo, prop_map=None):
         try:
             account_id = vehicleInfo.get('accountDBID') if vehicleInfo else None
             if not account_id:
@@ -163,24 +261,25 @@ class PatchBattlePlayer(object):
             wr_color = get_winrate_color(winrate) if winrate else '#FFFFFF'
             b_color = get_battles_color(battles) if battles else '#FFFFFF'
 
-            # Спробуємо всі можливі варіанти назв методів
-            for setter, value in (
-                ('setWn8', str(wn8) if g_configParams.showWn8.value and wn8 else ''),
-                ('setWn8Color', wn8_color),
-                ('setWN8', str(wn8) if g_configParams.showWn8.value and wn8 else ''),
-                ('setWinrate', ('%.1f%%' % winrate) if g_configParams.showWinrate.value and winrate else ''),
-                ('setWinrateColor', wr_color),
-                ('setWinRate', ('%.1f%%' % winrate) if g_configParams.showWinrate.value and winrate else ''),
-                ('setBattles', get_format_battles(battles) if g_configParams.showBattles.value and battles else ''),
-                ('setBattlesColor', b_color),
-            ):
-                if hasattr(player, setter):
-                    try:
-                        getattr(player, setter)(value)
-                    except Exception as e:
-                        logger.debug('[PatchBattlePlayer] %s failed: %s', setter, e)
+            if hasattr(player, 'setWn8Color'):
+                player.setWn8Color(wn8_color)
+            if hasattr(player, 'setWinrateColor'):
+                player.setWinrateColor(wr_color)
+            if hasattr(player, 'setBattlesColor'):
+                player.setBattlesColor(b_color)
 
-            logger.debug('[PatchBattlePlayer] Set wn8=%s for account %s', wn8, account_id)
+            if hasattr(player, 'setWn8'):
+                player.setWn8(str(wn8) if g_configParams.showWn8.value and wn8 else '')
+
+            if hasattr(player, 'setWinrate'):
+                player.setWinrate('%.1f%%' % winrate if g_configParams.showWinrate.value and winrate else '')
+
+            if hasattr(player, 'setBattles'):
+                player.setBattles(get_format_battles(battles) if g_configParams.showBattles.value and battles else '')
+
+            # Логуємо індекси з prop_map для першого гравця
+            if prop_map:
+                logger.debug('[PatchBattlePlayer] prop_map=%s for account %s', prop_map, account_id)
 
         except Exception as e:
             logger.debug('[PatchBattlePlayer] setValues failed: %s', e)
@@ -205,7 +304,22 @@ class PatchBattlePlayer(object):
                 except Exception:
                     pass
 
+            from gui.impl.gen.view_models.common.battle_player import BattlePlayer
             from gui.impl.battle.battle_page.tab_view import TabView
+
+            if self._original_battle_player_constructor:
+                BattlePlayer.__init__ = self._original_battle_player_constructor
+            if self._original_battle_player_initialize:
+                BattlePlayer._initialize = self._original_battle_player_initialize
+                for m in ('getWinrate', 'setWinrate', 'getWinrateColor', 'setWinrateColor',
+                          'getWn8', 'setWn8', 'getWn8Color', 'setWn8Color',
+                          'getBattles', 'setBattles', 'getBattlesColor', 'setBattlesColor'):
+                    if hasattr(BattlePlayer, m):
+                        try:
+                            delattr(BattlePlayer, m)
+                        except AttributeError:
+                            pass
+
             if self._original_fill_player_model:
                 TabView._fillPlayerModel = self._original_fill_player_model
             if self._original_fill_player_list_model:
