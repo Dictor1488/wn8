@@ -36,18 +36,56 @@ class PatchBattlePlayer(object):
 
 
     def _discover_property_count(self, original_init):
+        # Метод 1: через inspect — работает если properties имеет дефолтное значение
         try:
             argspec = inspect.getargspec(original_init)
+            logger.debug('[PatchBattlePlayer] BattlePlayer.__init__ args=%s defaults=%s',
+                         argspec.args, argspec.defaults)
             if argspec.defaults and 'properties' in argspec.args:
                 idx = argspec.args.index('properties') - 1
                 if 0 <= idx < len(argspec.defaults):
                     self._original_property_count = argspec.defaults[idx]
+                    logger.debug('[PatchBattlePlayer] property count from defaults: %s',
+                                 self._original_property_count)
         except Exception as e:
-            logger.debug('[PatchBattlePlayer] property discovery failed: %s', e)
+            logger.debug('[PatchBattlePlayer] inspect failed: %s', e)
+
+        # Метод 2: создаём временный экземпляр и смотрим внутренний счётчик ViewModel
+        if self._original_property_count is None:
+            try:
+                from gui.impl.gen.view_models.common.battle_player import BattlePlayer
+                tmp = object.__new__(BattlePlayer)
+                original_init(tmp)
+                for attr in ('_propertiesCount', '_propertyCount', '_properties_count'):
+                    if hasattr(tmp, attr):
+                        self._original_property_count = getattr(tmp, attr)
+                        logger.debug('[PatchBattlePlayer] property count from %s: %s',
+                                     attr, self._original_property_count)
+                        break
+            except Exception as e:
+                logger.debug('[PatchBattlePlayer] tmp instance discovery failed: %s', e)
+
+        # Метод 3: подсчёт property-дескрипторов в классе
+        if self._original_property_count is None:
+            try:
+                from gui.impl.gen.view_models.common.battle_player import BattlePlayer
+                count = sum(
+                    1 for name in dir(BattlePlayer)
+                    if name.startswith('get') and callable(getattr(BattlePlayer, name, None))
+                    and hasattr(BattlePlayer, 'set' + name[3:])
+                )
+                if count > 0:
+                    self._original_property_count = count
+                    logger.debug('[PatchBattlePlayer] property count from getter scan: %s', count)
+            except Exception as e:
+                logger.debug('[PatchBattlePlayer] getter scan failed: %s', e)
 
         if self._original_property_count is None:
             self._original_property_count = 37
+            logger.warning('[PatchBattlePlayer] Using fallback property count: 37')
+
         self._base_index = self._original_property_count
+        logger.debug('[PatchBattlePlayer] Final base_index=%s', self._base_index)
 
     def _make_getter(self, offset):
         def getter(self_):
