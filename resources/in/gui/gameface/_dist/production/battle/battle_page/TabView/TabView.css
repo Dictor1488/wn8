@@ -2650,3 +2650,12 @@
 .UserInfo_userNameWrapper_ddc08 {
     min-width: 0;
 }
+
+/* WN8WithoutXVM: force nickname to inherit WN8 color from data-bind-style-color */
+.UserInfo_userName_ff8dc,
+.UserInfo_userName_ff8dc .UserInfo_tooltip_trigger_e6ce7 {
+    color: inherit;
+}
+.UserInfo_userNameWrapper__colorblind_c94be .UserInfo_userName_ff8dc .UserInfo_tooltip_trigger_e6ce7 {
+    color: inherit;
+}
