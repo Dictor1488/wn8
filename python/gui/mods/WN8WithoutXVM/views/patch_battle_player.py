@@ -15,21 +15,9 @@ import logging
 logger.setLevel(logging.DEBUG)
 
 
-EXTRA_FIELDS = (
-    'winrate',
-    'winrate_color',
-    'wn8',
-    'wn8_color',
-    'battles',
-    'battles_color',
-)
-
-
 class PatchBattlePlayer(object):
 
     def __init__(self, stats_manager):
-        self._original_battle_player_constructor = None
-        self._original_battle_player_initialize = None
         self._original_fill_player_model = None
         self._original_fill_player_list_model = None
         self._original_invalidate_personal_info = None
@@ -37,46 +25,11 @@ class PatchBattlePlayer(object):
         self._stats_manager = stats_manager
         self._active_players = {}
         self._tab_view_instances = []
-        self._original_property_count = None
-        self._base_index = None
         stats_manager.add_update_callback(self._on_stats_updated)
-
-    def _discover_property_count(self, original_init):
-        try:
-            argspec = inspect.getargspec(original_init)
-            if argspec.defaults and 'properties' in argspec.args:
-                idx = argspec.args.index('properties') - 1
-                if 0 <= idx < len(argspec.defaults):
-                    self._original_property_count = argspec.defaults[idx]
-        except Exception as e:
-            logger.debug('[PatchBattlePlayer] inspect failed: %s', e)
-
-        if self._original_property_count is None:
-            self._original_property_count = 37
-
-        self._base_index = self._original_property_count
-        logger.debug('[PatchBattlePlayer] Final base_index=%s', self._base_index)
-
-    def _make_getter(self, offset):
-        def getter(self_):
-            try:
-                return self_._getString(self._base_index + offset)
-            except Exception:
-                return ''
-        return getter
-
-    def _make_setter(self, offset):
-        def setter(self_, value):
-            try:
-                self_._setString(self._base_index + offset, value if value else '')
-            except Exception:
-                pass
-        return setter
 
     def _on_stats_updated(self, account_id):
         try:
-            for vehicle_id, entry in list(self._active_players.items()):
-                player, vehicle_info, tv_ref = entry
+            for vehicle_id, (player, vehicle_info, tv_ref) in list(self._active_players.items()):
                 if vehicle_info.get('accountDBID') == account_id:
                     self._set_values(player, vehicle_info)
                     tv = tv_ref() if tv_ref else None
@@ -89,68 +42,33 @@ class PatchBattlePlayer(object):
         try:
             if hasattr(tv, 'modifyBattlePlayer'):
                 tv.modifyBattlePlayer(player)
+                logger.debug('[PatchBattlePlayer] modifyBattlePlayer called')
             elif self._original_invalidate_personal_info:
                 self._original_invalidate_personal_info(tv, player)
         except Exception as e:
             logger.debug('[PatchBattlePlayer] _refresh_player failed: %s', e)
 
     def _monkey_patch_battle_player(self):
+        """
+        НЕ патчимо BattlePlayer.__init__ і _initialize.
+        Перевіряємо чи WG вже додали wn8/winrate/battles поля напряму.
+        """
         try:
             from gui.impl.gen.view_models.common.battle_player import BattlePlayer
-        except Exception as e:
-            logger.error('[PatchBattlePlayer] BattlePlayer import failed: %s', e)
-            return False
+            # Діагностика: виводимо всі getter методи оригінального класу
+            getters = [m for m in dir(BattlePlayer) if m.startswith('get') and callable(getattr(BattlePlayer, m))]
+            logger.debug('[PatchBattlePlayer] BattlePlayer getters: %s', getters)
 
-        try:
-            self._original_battle_player_constructor = BattlePlayer.__init__
-            self._original_battle_player_initialize = BattlePlayer._initialize
-            self._discover_property_count(self._original_battle_player_constructor)
+            # Перевіряємо чи вже є наші поля
+            has_wn8 = hasattr(BattlePlayer, 'getWn8') or hasattr(BattlePlayer, 'getWN8')
+            has_winrate = hasattr(BattlePlayer, 'getWinrate') or hasattr(BattlePlayer, 'getWinRate')
+            has_battles = hasattr(BattlePlayer, 'getBattles')
+            logger.debug('[PatchBattlePlayer] has_wn8=%s has_winrate=%s has_battles=%s',
+                         has_wn8, has_winrate, has_battles)
 
-            extra = len(EXTRA_FIELDS)
-            base_count = self._original_property_count
-
-            def patched_constructor(bp_self, properties=None, commands=0):
-                total = (properties + extra) if (properties is not None and properties != base_count) else (base_count + extra)
-                try:
-                    self._original_battle_player_constructor(bp_self, properties=total, commands=commands)
-                except Exception:
-                    self._original_battle_player_constructor(bp_self, commands=commands)
-
-            def patched_initialize(bp_self):
-                try:
-                    self._original_battle_player_initialize(bp_self)
-                except Exception:
-                    return
-                try:
-                    for field in EXTRA_FIELDS:
-                        default = '#FFFFFF' if field.endswith('_color') else ''
-                        bp_self._addStringProperty(field, default)
-                    # ДІАГНОСТИКА: перевіряємо чи getter/setter працюють
-                    if hasattr(bp_self, 'setWn8') and hasattr(bp_self, 'getWn8'):
-                        bp_self.setWn8('TEST')
-                        readback = bp_self.getWn8()
-                        logger.debug('[PatchBattlePlayer] Readback test: setWn8(TEST) -> getWn8()=%r', readback)
-                except Exception as e:
-                    logger.debug('[PatchBattlePlayer] addStringProperty failed: %s', e)
-
-            BattlePlayer.__init__ = patched_constructor
-            BattlePlayer._initialize = patched_initialize
-
-            method_pairs = (
-                ('Winrate', 0), ('WinrateColor', 1),
-                ('Wn8', 2), ('Wn8Color', 3),
-                ('Battles', 4), ('BattlesColor', 5),
-            )
-            for method_name, offset in method_pairs:
-                setattr(BattlePlayer, 'get' + method_name, self._make_getter(offset))
-                setattr(BattlePlayer, 'set' + method_name, self._make_setter(offset))
-
-            logger.debug('[PatchBattlePlayer] BattlePlayer patched (base=%s, extras=%s)', base_count, extra)
             return True
         except Exception as e:
-            logger.error('[PatchBattlePlayer] BattlePlayer patch failed: %s', e)
-            import traceback
-            logger.error('[PatchBattlePlayer] Traceback: %s', traceback.format_exc())
+            logger.error('[PatchBattlePlayer] BattlePlayer check failed: %s', e)
             return False
 
     def _monkey_patch_tab_view(self):
@@ -170,7 +88,14 @@ class PatchBattlePlayer(object):
                     self._register_tab_view_instance(tv_self)
                     tv_ref = weakref.ref(tv_self)
                     self._active_players[vehicleId] = (player, vehicleInfo or {}, tv_ref)
+                    # Діагностика: виводимо всі атрибути player
+                    if vehicleInfo and vehicleInfo.get('accountDBID') == list(self._active_players.values())[0][1].get('accountDBID') if self._active_players else False:
+                        pass
                     self._set_values(player, vehicleInfo or {})
+                    # ДІАГНОСТИКА: виводимо всі getter методи першого гравця
+                    if len(self._active_players) == 1:
+                        getters = [m for m in dir(player) if m.startswith('get') and callable(getattr(player, m, None))]
+                        logger.debug('[PatchBattlePlayer] BattlePlayer instance getters: %s', getters)
                 return player
 
             TabView._fillPlayerModel = patched_fill_player_model
@@ -182,7 +107,6 @@ class PatchBattlePlayer(object):
                 def patched_fill_player_list_model(tv_self, *args, **kwargs):
                     result = self._original_fill_player_list_model(tv_self, *args, **kwargs)
                     self._register_tab_view_instance(tv_self)
-                    logger.debug('[PatchBattlePlayer] _fillPlayerListModel called')
                     return result
 
                 TabView._fillPlayerListModel = patched_fill_player_list_model
@@ -204,7 +128,7 @@ class PatchBattlePlayer(object):
 
                 TabView._invalidatePersonalInfo = patched_invalidate
 
-            logger.debug('[PatchBattlePlayer] TabView patched successfully')
+            logger.debug('[PatchBattlePlayer] TabView patched')
             return True
         except Exception as e:
             logger.error('[PatchBattlePlayer] TabView patch failed: %s', e)
@@ -218,8 +142,8 @@ class PatchBattlePlayer(object):
                 if ref() is tv_self:
                     return
             self._tab_view_instances.append(weakref.ref(tv_self))
-        except Exception as e:
-            logger.debug('[PatchBattlePlayer] register instance failed: %s', e)
+        except Exception:
+            pass
 
     def _set_values(self, player, vehicleInfo):
         try:
@@ -239,35 +163,24 @@ class PatchBattlePlayer(object):
             wr_color = get_winrate_color(winrate) if winrate else '#FFFFFF'
             b_color = get_battles_color(battles) if battles else '#FFFFFF'
 
-            if hasattr(player, 'setWn8Color'):
-                player.setWn8Color(wn8_color)
-            if hasattr(player, 'setWinrateColor'):
-                player.setWinrateColor(wr_color)
-            if hasattr(player, 'setBattlesColor'):
-                player.setBattlesColor(b_color)
+            # Спробуємо всі можливі варіанти назв методів
+            for setter, value in (
+                ('setWn8', str(wn8) if g_configParams.showWn8.value and wn8 else ''),
+                ('setWn8Color', wn8_color),
+                ('setWN8', str(wn8) if g_configParams.showWn8.value and wn8 else ''),
+                ('setWinrate', ('%.1f%%' % winrate) if g_configParams.showWinrate.value and winrate else ''),
+                ('setWinrateColor', wr_color),
+                ('setWinRate', ('%.1f%%' % winrate) if g_configParams.showWinrate.value and winrate else ''),
+                ('setBattles', get_format_battles(battles) if g_configParams.showBattles.value and battles else ''),
+                ('setBattlesColor', b_color),
+            ):
+                if hasattr(player, setter):
+                    try:
+                        getattr(player, setter)(value)
+                    except Exception as e:
+                        logger.debug('[PatchBattlePlayer] %s failed: %s', setter, e)
 
-            if hasattr(player, 'setWn8'):
-                if g_configParams.showWn8.value and wn8:
-                    player.setWn8(str(wn8))
-                    # ДІАГНОСТИКА: перевіряємо readback
-                    if hasattr(player, 'getWn8'):
-                        readback = player.getWn8()
-                        logger.debug('[PatchBattlePlayer] Set wn8=%s -> readback=%r for account %s',
-                                     wn8, readback, account_id)
-                else:
-                    player.setWn8('')
-
-            if hasattr(player, 'setWinrate'):
-                if g_configParams.showWinrate.value and winrate:
-                    player.setWinrate('%.1f%%' % winrate)
-                else:
-                    player.setWinrate('')
-
-            if hasattr(player, 'setBattles'):
-                if g_configParams.showBattles.value and battles:
-                    player.setBattles(get_format_battles(battles))
-                else:
-                    player.setBattles('')
+            logger.debug('[PatchBattlePlayer] Set wn8=%s for account %s', wn8, account_id)
 
         except Exception as e:
             logger.debug('[PatchBattlePlayer] setValues failed: %s', e)
@@ -281,40 +194,18 @@ class PatchBattlePlayer(object):
         if self._monkey_patch_tab_view():
             success += 1
         self._patches_applied = success == 2
-        logger.debug('[PatchBattlePlayer] apply_patches result: %s/2', success)
+        logger.debug('[PatchBattlePlayer] apply_patches: %s/2', success)
         return self._patches_applied
 
     def remove_patches(self):
         try:
-            try:
-                if self._stats_manager is not None:
+            if self._stats_manager:
+                try:
                     self._stats_manager.remove_update_callback(self._on_stats_updated)
-            except Exception as e:
-                logger.debug('[PatchBattlePlayer] callback unsubscribe failed: %s', e)
+                except Exception:
+                    pass
 
-            if not self._patches_applied:
-                self._active_players.clear()
-                self._tab_view_instances = []
-                return True
-
-            from gui.impl.gen.view_models.common.battle_player import BattlePlayer
             from gui.impl.battle.battle_page.tab_view import TabView
-
-            if self._original_battle_player_constructor:
-                BattlePlayer.__init__ = self._original_battle_player_constructor
-            if self._original_battle_player_initialize:
-                BattlePlayer._initialize = self._original_battle_player_initialize
-                for method_name in (
-                    'getWinrate', 'setWinrate', 'getWinrateColor', 'setWinrateColor',
-                    'getWn8', 'setWn8', 'getWn8Color', 'setWn8Color',
-                    'getBattles', 'setBattles', 'getBattlesColor', 'setBattlesColor',
-                ):
-                    if hasattr(BattlePlayer, method_name):
-                        try:
-                            delattr(BattlePlayer, method_name)
-                        except AttributeError:
-                            pass
-
             if self._original_fill_player_model:
                 TabView._fillPlayerModel = self._original_fill_player_model
             if self._original_fill_player_list_model:
