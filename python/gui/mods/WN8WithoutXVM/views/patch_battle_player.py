@@ -15,9 +15,9 @@ class PatchBattlePlayer(object):
     """
     Reliable TAB stats patch.
 
-    Some WoT Gameface TAB builds do not render modified userName directly.
-    The vehicle name column is rendered consistently, so stats are duplicated
-    into vehicleName as a fallback: [WN8|WR|BATTLES] Vehicle.
+    Do not touch userName anymore: in current Gameface TAB it breaks visible
+    nick/clan layout. Stats are written only into vehicleName, which is known
+    to be rendered in TAB.
     """
 
     def __init__(self, stats_manager):
@@ -25,16 +25,16 @@ class PatchBattlePlayer(object):
         self._original_invalidate_personal_info = None
         self._patches_applied = False
         self._stats_manager = stats_manager
-        # vehicleId -> (player, vehicleInfo, original_user_name, original_vehicle_name, tab_view_ref)
+        # vehicleId -> (player, vehicleInfo, original_vehicle_name, tab_view_ref)
         self._active_players = {}
         self._tab_view_instances = []
         stats_manager.add_update_callback(self._on_stats_updated)
 
     def _on_stats_updated(self, account_id):
         try:
-            for vid, (player, info, original_user_name, original_vehicle_name, tv_ref) in list(self._active_players.items()):
+            for vid, (player, info, original_vehicle_name, tv_ref) in list(self._active_players.items()):
                 if info.get('accountDBID') == account_id:
-                    self._set_tab_fields(player, info, original_user_name, original_vehicle_name)
+                    self._set_tab_vehicle_name(player, info, original_vehicle_name)
                     tv = tv_ref() if tv_ref else None
                     if tv is not None:
                         try:
@@ -89,7 +89,7 @@ class PatchBattlePlayer(object):
             pass
         return u'|'.join([self._to_unicode(p) for p in parts])
 
-    def _set_tab_fields(self, player, vehicleInfo, original_user_name, original_vehicle_name):
+    def _set_tab_vehicle_name(self, player, vehicleInfo, original_vehicle_name):
         try:
             account_id = vehicleInfo.get('accountDBID') if vehicleInfo else None
             if not account_id:
@@ -100,30 +100,19 @@ class PatchBattlePlayer(object):
                 return
 
             prefix = self._build_stats_prefix(stats)
-            clean_name = self._strip_old_stats_prefix(original_user_name)
             clean_vehicle = self._strip_old_stats_prefix(original_vehicle_name)
-
-            display_name = u'[%s] %s' % (prefix, clean_name) if prefix else clean_name
             display_vehicle = u'[%s] %s' % (prefix, clean_vehicle) if prefix else clean_vehicle
 
-            changed = False
-            if hasattr(player, 'setUserName'):
-                player.setUserName(display_name)
-                changed = True
             if hasattr(player, 'setVehicleName'):
                 player.setVehicleName(display_vehicle)
-                changed = True
-
-            if changed:
-                logger.debug('[PatchBattlePlayer] TAB fields set for %s: name=%s vehicle=%s',
-                             account_id, display_name, display_vehicle)
+                logger.debug('[PatchBattlePlayer] TAB vehicle set for %s: %s', account_id, display_vehicle)
             else:
-                logger.debug('[PatchBattlePlayer] no setters found for TAB fields')
+                logger.debug('[PatchBattlePlayer] setVehicleName not found')
         except Exception as e:
-            logger.debug('[PatchBattlePlayer] _set_tab_fields failed: %s', e)
+            logger.debug('[PatchBattlePlayer] _set_tab_vehicle_name failed: %s', e)
 
     def _monkey_patch_battle_player(self):
-        logger.debug('[PatchBattlePlayer] Using userName + vehicleName TAB transport')
+        logger.debug('[PatchBattlePlayer] Using vehicleName-only TAB stats transport')
         return True
 
     def _monkey_patch_tab_view(self):
@@ -142,20 +131,14 @@ class PatchBattlePlayer(object):
                 if player is not None:
                     self._register_tab_view_instance(tv_self)
                     tv_ref = weakref.ref(tv_self)
-                    original_user_name = u''
                     original_vehicle_name = u''
-                    try:
-                        if hasattr(player, 'getUserName'):
-                            original_user_name = self._strip_old_stats_prefix(player.getUserName() or u'')
-                    except Exception:
-                        original_user_name = u''
                     try:
                         if hasattr(player, 'getVehicleName'):
                             original_vehicle_name = self._strip_old_stats_prefix(player.getVehicleName() or u'')
                     except Exception:
                         original_vehicle_name = u''
-                    self._active_players[vehicleId] = (player, vehicleInfo or {}, original_user_name, original_vehicle_name, tv_ref)
-                    self._set_tab_fields(player, vehicleInfo or {}, original_user_name, original_vehicle_name)
+                    self._active_players[vehicleId] = (player, vehicleInfo or {}, original_vehicle_name, tv_ref)
+                    self._set_tab_vehicle_name(player, vehicleInfo or {}, original_vehicle_name)
                 return player
 
             TabView._fillPlayerModel = patched_fill_player_model
@@ -170,14 +153,14 @@ class PatchBattlePlayer(object):
                         if hasattr(player, 'getVehicleId'):
                             vid = player.getVehicleId()
                             if vid and vid in self._active_players:
-                                p, info, original_user_name, original_vehicle_name, _ = self._active_players[vid]
-                                self._set_tab_fields(p, info, original_user_name, original_vehicle_name)
+                                p, info, original_vehicle_name, _ = self._active_players[vid]
+                                self._set_tab_vehicle_name(p, info, original_vehicle_name)
                     except Exception as e:
                         logger.debug('[PatchBattlePlayer] invalidate: %s', e)
 
                 TabView._invalidatePersonalInfo = patched_invalidate
 
-            logger.debug('[PatchBattlePlayer] TabView patched with userName + vehicleName stats')
+            logger.debug('[PatchBattlePlayer] TabView patched with vehicleName-only stats')
             return True
         except Exception as e:
             logger.error('[PatchBattlePlayer] TabView patch failed: %s', e)
