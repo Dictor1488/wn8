@@ -2581,3 +2581,40 @@
 .WN8TabStats_wn8 {
     min-width: 34rem;
 }
+
+/* WN8WithoutXVM TAB stats v3: keep nick visible */
+.UserInfo_user_info_ee23d {
+    width: 210rem;
+}
+.UserInfo_nickname_wrapper_af103 {
+    width: 181rem;
+}
+.WN8TabStats {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 1rem;
+    margin: -1rem 3rem 0 0;
+    font-size: 11rem;
+    line-height: 1;
+    white-space: nowrap;
+    pointer-events: none;
+}
+.WN8TabStats_right {
+    flex-direction: row-reverse;
+    margin: -1rem 0 0 3rem;
+}
+.WN8TabStats_item {
+    min-width: 22rem;
+    text-align: center;
+    text-shadow: 0 0 2rem #000, 0 0 3rem #000;
+}
+.WN8TabStats_battles {
+    min-width: 28rem;
+}
+.WN8TabStats_wr {
+    min-width: 31rem;
+}
+.WN8TabStats_wn8 {
+    min-width: 26rem;
+}
