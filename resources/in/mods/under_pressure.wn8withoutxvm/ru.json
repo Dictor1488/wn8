@@ -1,0 +1,22 @@
+{
+    "modname": "WN8 Без XVM",
+    "checked": "включен",
+    "unchecked": "выключен",
+    "defaultValue": "по умолчанию",
+    "showWn8.header": "Показывать WN8",
+    "showWn8.body": "Отображать WN8 в бою (рассчитывается напрямую через WG API + ожидаемые значения WN8)",
+    "showWinrate.header": "Показывать винрейт",
+    "showWinrate.body": "Отображать процент побед в бою",
+    "showBattles.header": "Показывать бои",
+    "showBattles.body": "Отображать количество боёв",
+    "panelWinratePosition.header": "Позиция винрейта на панели",
+    "panelWinratePosition.body": "Где показывать винрейт на панели игроков",
+    "winratePosition.nearIcon": "Возле иконки техники",
+    "winratePosition.beforeVehicle": "Перед названием техники",
+    "winratePosition.none": "Не показывать",
+    "wgApiRegion.header": "Регион WG API",
+    "wgApiRegion.body": "Регион сервера для запросов WG Public API",
+    "region.eu": "Европа",
+    "region.na": "Северная Америка",
+    "region.asia": "Азия"
+}

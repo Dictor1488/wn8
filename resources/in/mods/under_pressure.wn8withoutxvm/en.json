@@ -1,0 +1,22 @@
+{
+    "modname": "WN8 Without XVM",
+    "checked": "enabled",
+    "unchecked": "disabled",
+    "defaultValue": "default",
+    "showWn8.header": "Show WN8",
+    "showWn8.body": "Display WN8 rating in battle (calculated directly using WG API + WN8 expected values)",
+    "showWinrate.header": "Show Winrate",
+    "showWinrate.body": "Display winrate percentage in battle",
+    "showBattles.header": "Show Battles",
+    "showBattles.body": "Display number of battles",
+    "panelWinratePosition.header": "Winrate Position on Panel",
+    "panelWinratePosition.body": "Where to show winrate on players panel",
+    "winratePosition.nearIcon": "Near vehicle icon",
+    "winratePosition.beforeVehicle": "Before vehicle name",
+    "winratePosition.none": "Don't show",
+    "wgApiRegion.header": "WG API Region",
+    "wgApiRegion.body": "Server region used for WG Public API requests",
+    "region.eu": "Europe",
+    "region.na": "North America",
+    "region.asia": "Asia"
+}
